@@ -35,10 +35,10 @@ jobs:
         if: steps.time_check.outputs.run_now == 'true'
         run: pip install -r requirements.txt
 
-      - name: Volume Scanner 1
+      - name: All-Time-High Scanner 1
         if: steps.time_check.outputs.run_now == 'true'
         env:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           ALERT_TO: jordycrod1@gmail.com
-        run: scanner_volume.py
+        run: scanner_All-Time-High_1.py

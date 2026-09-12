@@ -16,6 +16,8 @@ jobs:
       - name: Check if it's actually 4:30 PM Eastern right now
         id: time_check
         run: |
+          echo "TESTING MODE - forcing run_now=true"
+          echo "run_now=true" >> "$GITHUB_OUTPUT"
           #current_hour_et=$(TZ="America/New_York" date +%H)
           #current_min_et=$(TZ="America/New_York" date +%M)
           #echo "Current Eastern time: $current_hour_et:$current_min_et"

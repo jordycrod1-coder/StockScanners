@@ -43,4 +43,4 @@ jobs:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           ALERT_TO: jordycrod1@gmail.com
-        run: scanner_All-Time-High_1.py
+        run: python scanner_All-Time-High_1.py

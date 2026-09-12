@@ -2,17 +2,16 @@ name: Stock Scanners
 
 on:
   schedule:
-    - cron: '30 20 * * 1-5'   # fires at 4:30 PM EDT (summer)
-    - cron: '30 21 * * 1-5'   # fires at 4:30 PM EST (winter)
+    - cron: '30 20 * * 1-5'   # 4:30 PM EDT
+    - cron: '30 21 * * 1-5'   # 4:30 PM EST
   workflow_dispatch:
 
 jobs:
-  run-scanners:
+  time-check:
     runs-on: ubuntu-latest
+    outputs:
+      run_now: ${{ steps.time_check.outputs.run_now }}
     steps:
-      - name: Check out repo
-        uses: actions/checkout@v4
-
       - name: Check if it's actually 4:30 PM Eastern right now
         id: time_check
         run: |
@@ -22,23 +21,22 @@ jobs:
           #current_min_et=$(TZ="America/New_York" date +%M)
           #echo "Current Eastern time: $current_hour_et:$current_min_et"
           #if [ "$current_hour_et" = "16" ] && [ "$current_min_et" = "30" ]; then
-           # echo "run_now=true" >> "$GITHUB_OUTPUT"
+          #  echo "run_now=true" >> "$GITHUB_OUTPUT"
           #else
           #  echo "run_now=false" >> "$GITHUB_OUTPUT"
           #fi
 
-      - name: Set up Python
-        if: steps.time_check.outputs.run_now == 'true'
-        uses: actions/setup-python@v5
+  ath-scanner:
+    needs: time-check
+    if: needs.time-check.outputs.run_now == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Install dependencies
-        if: steps.time_check.outputs.run_now == 'true'
-        run: pip install -r requirements.txt
-
-      - name: All-Time-High Scanner 1
-        if: steps.time_check.outputs.run_now == 'true'
+      - run: pip install -r requirements.txt
+      - name: Run ATH Scanner
         env:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}

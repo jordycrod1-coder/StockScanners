@@ -3,6 +3,7 @@ import smtplib
 import warnings
 from datetime import datetime
 from email.mime.text import MIMEText
+from io import StringIO
 
 import yfinance as yf
 import pandas as pd
@@ -86,7 +87,7 @@ def get_sp500():
     r = requests.get(url, headers=headers, timeout=10)
     r.raise_for_status()
 
-    tables = pd.read_html(r.text)
+    tables = pd.read_html(StringIO(r.text))
     df = tables[0]
     df.columns = [c.strip() for c in df.columns]
 

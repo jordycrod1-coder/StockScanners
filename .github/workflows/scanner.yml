@@ -2,8 +2,8 @@ name: Stock Scanners
 
 on:
   schedule:
-    - cron: '30 20 * * 1-5'   # 4:30 PM EDT
-    - cron: '30 21 * * 1-5'   # 4:30 PM EST
+    - cron: '30 15 * * 1-5'   # 4:30 PM EDT
+    - cron: '30 16 * * 1-5'   # 4:30 PM EST
   workflow_dispatch:
 
 jobs:
@@ -15,16 +15,16 @@ jobs:
       - name: Check if it's actually 4:30 PM Eastern right now
         id: time_check
         run: |
-          echo "TESTING MODE - forcing run_now=true"
-          echo "run_now=true" >> "$GITHUB_OUTPUT"
-          #current_hour_et=$(TZ="America/New_York" date +%H)
-          #current_min_et=$(TZ="America/New_York" date +%M)
-          #echo "Current Eastern time: $current_hour_et:$current_min_et"
-          #if [ "$current_hour_et" = "16" ] && [ "$current_min_et" = "30" ]; then
-          #  echo "run_now=true" >> "$GITHUB_OUTPUT"
-          #else
-          #  echo "run_now=false" >> "$GITHUB_OUTPUT"
-          #fi
+          #echo "TESTING MODE - forcing run_now=true"
+          #echo "run_now=true" >> "$GITHUB_OUTPUT"
+          current_hour_et=$(TZ="America/New_York" date +%H)
+          current_min_et=$(TZ="America/New_York" date +%M)
+          echo "Current Eastern time: $current_hour_et:$current_min_et"
+          if [ "$current_hour_et" = "16" ] && [ "$current_min_et" = "30" ]; then
+            echo "run_now=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_now=false" >> "$GITHUB_OUTPUT"
+          fi
 
   Scanner_All-Time-Highs:
     needs: time-check

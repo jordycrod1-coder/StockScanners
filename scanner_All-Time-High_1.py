@@ -52,7 +52,7 @@ SECTOR_ETF_MAP = {
 # EMAIL SETTINGS
 # ============================================================
 
-SCANNER_NAME = "ATH Breakout Scanner"   # used in the email subject line
+SCANNER_NAME = "Scanner_All-Time-High"   # used in the email subject line
 
 EMAIL_USER = os.environ.get("EMAIL_USER")   # sending gmail address
 EMAIL_PASS = os.environ.get("EMAIL_PASS")   # gmail app password

@@ -2,33 +2,12 @@ name: Stock Scanners
 
 on:
   schedule:
-    - cron: '0 13 * * 0-6'   # 4:30 PM EDT
-    - cron: '0 14 * * 0-6'   # 4:30 PM EST
+    - cron: '20 8 * * 0-6'    # 8:30 AM
+      timezone: 'America/Chicago'
   workflow_dispatch:
 
 jobs:
-  time-check:
-    runs-on: ubuntu-latest
-    outputs:
-      run_now: ${{ steps.time_check.outputs.run_now }}
-    steps:
-      - name: Check if it's actually 4:30 PM Eastern right now
-        id: time_check
-        run: |
-          #echo "TESTING MODE - forcing run_now=true"
-          #echo "run_now=true" >> "$GITHUB_OUTPUT"
-          current_hour_et=$(TZ="America/New_York" date +%H)
-          current_min_et=$(TZ="America/New_York" date +%M)
-          echo "Current Eastern time: $current_hour_et:$current_min_et"
-          if [ "$current_hour_et" = "16" ] && [ "$current_min_et" = "30" ]; then
-            echo "run_now=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run_now=false" >> "$GITHUB_OUTPUT"
-          fi
-
   Scanner_All-Time-Highs:
-    needs: time-check
-    if: needs.time-check.outputs.run_now == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

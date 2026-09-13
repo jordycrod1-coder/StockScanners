@@ -2,8 +2,8 @@ name: Stock Scanners
 
 on:
   schedule:
-    - cron: '20 8 * * 0-6'    # 8:30 AM
-      timezone: 'America/Chicago'
+    - cron: '30 16 * * 0-6'   # 4:30 PM
+      timezone: 'America/New_York'
   workflow_dispatch:
 
 jobs:

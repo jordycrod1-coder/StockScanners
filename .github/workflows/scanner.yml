@@ -2,9 +2,22 @@ name: Stock Scanners
 
 on:
   schedule:
-    - cron: '15 16 * * 1-5'   # 4:30 PM
+    - cron: '15 16 * * 1-5'   # 4:15 PM ET - scanners
+      timezone: 'America/New_York'
+    - cron: '35 16 * * 1-5'   # 4:35 PM ET - dashboard (after market close)
       timezone: 'America/New_York'
   workflow_dispatch:
+
+# Needed so this workflow can publish to GitHub Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deployment at a time; don't cancel one that's mid-flight.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
 jobs:
   Scanner_All-Time-Highs:
@@ -21,3 +34,29 @@ jobs:
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           ALERT_TO: jordycrod1@gmail.com
         run: python scanner_All-Time-High_1.py
+
+  Dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Generate S&P 500 dashboard
+        run: python dashboard_sp500.py
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy-pages:
+    needs: Dashboard
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

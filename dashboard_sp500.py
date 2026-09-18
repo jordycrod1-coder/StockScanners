@@ -29,6 +29,7 @@
 # RS-Ratio / RS-Momentum, not dates) stay where they were, below the stack.
 # ============================================================
 
+import io
 import os
 import warnings
 from datetime import datetime
@@ -251,7 +252,7 @@ def get_sp500_table():
     headers = {"User-Agent": "Mozilla/5.0"}
     response = requests.get(url, headers=headers, timeout=30)
     response.raise_for_status()
-    table = pd.read_html(response.text)[0]
+    table = pd.read_html(io.StringIO(response.text))[0]
     table.columns = [str(c).strip() for c in table.columns]
     table["Symbol"] = table["Symbol"].astype(str).str.replace(".", "-", regex=False)
     return table

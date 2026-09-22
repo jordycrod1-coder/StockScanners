@@ -4,8 +4,6 @@ on:
   schedule:
     - cron: '15 16 * * 1-5'   # 4:15 PM ET - scanners
       timezone: 'America/New_York'
-    - cron: '35 16 * * 1-5'   # 4:35 PM ET - dashboard (after market close)
-      timezone: 'America/New_York'
   workflow_dispatch:
 
 # Needed so this workflow can publish to GitHub Pages.

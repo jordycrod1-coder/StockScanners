@@ -895,6 +895,254 @@ for name, df in cross_asset.items():
 cross_df = pd.DataFrame(cross_rows, columns=["Asset", "Last", "5D %", "20D %"])
 
 # ============================================================
+# DECISION SUMMARY DASHBOARD (standalone figure)
+# ============================================================
+# This is kept as its own standalone figure, saved and generated BEFORE the
+# big GridSpec dashboard below, for the same reason the sector-strength
+# charts further down are also kept standalone: the main dashboard's
+# GridSpec row math is precisely tuned to N_ROWS, so adding rows to it would
+# require re-deriving every row index that follows. A separate figure avoids
+# that risk entirely.
+#
+# The goal here is a fast, top-of-page answer to "what's the market doing
+# and should I be leaning bullish, cautious, or defensive right now" —
+# organized into the same kind of topic sections as the rest of the
+# dashboard, each with a green/yellow/red read, plus a per-sector status bar
+# chart (green = leading, yellow = neutral, red = lagging) in the same
+# bars-per-sector style as the RS charts elsewhere in this script.
+# ============================================================
+
+STATUS_BG = {"green": "#c8e6c9", "yellow": "#fff9c4", "red": "#ffcdd2"}
+STATUS_FG = {"green": "#1a7a1a", "yellow": "#8a6d00", "red": "#b02020"}
+STATUS_WORD = {"green": "GOOD", "yellow": "CAUTION", "red": "NEGATIVE"}
+
+
+def draw_status_card(ax, title, status, headline, detail_lines):
+    """Draws one colored status card: title, GOOD/CAUTION/NEGATIVE word,
+    a bold headline stat, and a few smaller detail lines underneath."""
+    ax.axis("off")
+    ax.set_facecolor(STATUS_BG.get(status, "#f0f0f0"))
+    fg = STATUS_FG.get(status, "#333333")
+    ax.text(0.05, 0.88, title, fontsize=11, fontweight="bold", color="#555555",
+            transform=ax.transAxes, va="top")
+    ax.text(0.05, 0.70, STATUS_WORD.get(status, status.upper()), fontsize=15,
+            fontweight="bold", color=fg, transform=ax.transAxes, va="top")
+    ax.text(0.05, 0.52, headline, fontsize=9.5, fontweight="bold", color="#222222",
+            transform=ax.transAxes, va="top")
+    for i, line in enumerate(detail_lines):
+        ax.text(0.05, 0.36 - i * 0.16, line, fontsize=8.7, color="#333333",
+                transform=ax.transAxes, va="top")
+
+
+# --- classify each topic into green / yellow / red ---
+
+trend_above_all = last_close > last_ma20 > last_ma50 > last_ma200
+trend_below_all = last_close < last_ma20 < last_ma50 < last_ma200
+trend_status = "green" if (trend_above_all and ma_slopes["50MA slope 10D"] > 0) else (
+    "red" if (trend_below_all and ma_slopes["50MA slope 10D"] < 0) else "yellow"
+)
+
+macd_bull_spy = last_macd > last_signal
+if last_rsi > 55 and macd_bull_spy:
+    momentum_status = "green"
+elif last_rsi < 45 and not macd_bull_spy:
+    momentum_status = "red"
+else:
+    momentum_status = "yellow"
+
+vix_status = "red" if (vix_zone == "High" or vol_structure == "Stress / Backwardation") else (
+    "green" if (vix_zone in ("Low", "Normal") and vol_structure == "Normal / Contango") else "yellow"
+)
+
+breadth_status = "green" if (latest_breadth[20] > 55 and latest_breadth[50] > 55) else (
+    "red" if (latest_breadth[20] < 45 and latest_breadth[50] < 45) else "yellow"
+)
+
+internals_status = "green" if (latest_trin < 1.0 and latest_mcclellan > 0 and latest_highs > latest_lows) else (
+    "red" if (latest_trin > 1.2 and latest_mcclellan < 0 and latest_lows > latest_highs) else "yellow"
+)
+
+volume_status = "green" if latest_upvol_pct > 55 else ("red" if latest_upvol_pct < 45 else "yellow")
+
+macro_status = "red" if yield_curve_status == "Inverted (recession signal)" else (
+    "green" if yield_curve_status == "Normal" else "yellow"
+)
+
+sector_emergence_counts = {"green": 0, "yellow": 0, "red": 0}
+for _etf, _stats in sector_stats.items():
+    if _stats["emergence"] in ("EMERGING", "LEADING"):
+        sector_emergence_counts["green"] += 1
+    elif _stats["emergence"] in ("LAGGING", "WEAKENING"):
+        sector_emergence_counts["red"] += 1
+    else:
+        sector_emergence_counts["yellow"] += 1
+rotation_status = "green" if sector_emergence_counts["green"] > sector_emergence_counts["red"] + 2 else (
+    "red" if sector_emergence_counts["red"] > sector_emergence_counts["green"] + 2 else "yellow"
+)
+
+ranked_for_summary = sorted(sector_stats.items(), key=lambda kv: kv[1]["emergence_score"], reverse=True)
+
+overall_status = "green" if regime_score >= 7 else ("red" if regime_score <= -4 else "yellow")
+
+# --- build the figure ---
+
+fig_ds = plt.figure(figsize=(16, 15))
+gs_ds = gridspec.GridSpec(
+    4, 4,
+    height_ratios=[1.3, 2.6, 2.6, 6.0],
+    hspace=0.55, wspace=0.18,
+    figure=fig_ds, top=0.97, bottom=0.03, left=0.04, right=0.98,
+)
+
+# Row 0 — overall regime banner, full width
+ax_overall = fig_ds.add_subplot(gs_ds[0, :])
+ax_overall.axis("off")
+ax_overall.set_facecolor(STATUS_BG[overall_status])
+ax_overall.text(0.015, 0.72, "OVERALL MARKET STATUS", fontsize=13, fontweight="bold",
+                 color="#666666", transform=ax_overall.transAxes, va="center")
+ax_overall.text(0.015, 0.30,
+                 f"{regime_label}  ({STATUS_WORD[overall_status]})   |   Score {regime_score:+d} / 10",
+                 fontsize=22, fontweight="bold", color=STATUS_FG[overall_status],
+                 transform=ax_overall.transAxes, va="center")
+ax_overall.text(0.72, 0.5,
+                 f"SPY ${last_close:,.2f}\n5D {market_returns['5D']:+.1f}%  |  20D {market_returns['20D']:+.1f}%",
+                 fontsize=11, color="#222222", transform=ax_overall.transAxes, va="center", ha="left")
+
+# Row 1 — Trend / Momentum / Volatility / Breadth
+ax_trend = fig_ds.add_subplot(gs_ds[1, 0])
+draw_status_card(
+    ax_trend, "TREND", trend_status,
+    f"SPY ${last_close:,.2f}  |  20D {market_returns['20D']:+.1f}%",
+    [
+        f"Above 20/50/200MA: {'Y' if last_close > last_ma20 else 'N'}/"
+        f"{'Y' if last_close > last_ma50 else 'N'}/{'Y' if last_close > last_ma200 else 'N'}",
+        f"50MA slope (10D): {ma_slopes['50MA slope 10D']:+.1f}%",
+        f"Dist. from 52W high: {distance_from_ath:+.1f}%",
+    ],
+)
+
+ax_mom = fig_ds.add_subplot(gs_ds[1, 1])
+draw_status_card(
+    ax_mom, "MOMENTUM", momentum_status,
+    f"RSI {last_rsi:.1f}  |  MACD {'Bullish' if macd_bull_spy else 'Bearish'}",
+    [
+        "Overbought (>70)" if last_rsi > 70 else ("Oversold (<30)" if last_rsi < 30 else "Neutral RSI zone"),
+        f"1D {market_returns['1D']:+.1f}%  |  10D {market_returns['10D']:+.1f}%",
+    ],
+)
+
+ax_vix = fig_ds.add_subplot(gs_ds[1, 2])
+draw_status_card(
+    ax_vix, "VOLATILITY", vix_status,
+    f"VIX {last_vix:.1f}  ({vix_zone})",
+    [
+        f"5D {vix_5d_change:+.1f}%  |  20D {vix_20d_change:+.1f}%",
+        f"Term structure: {vol_structure}",
+    ],
+)
+
+ax_breadth = fig_ds.add_subplot(gs_ds[1, 3])
+draw_status_card(
+    ax_breadth, "BREADTH", breadth_status,
+    f">20MA {latest_breadth[20]:.0f}%  |  >50MA {latest_breadth[50]:.0f}%",
+    [
+        f">200MA {latest_breadth[200]:.0f}%",
+        f"5D change: {breadth_change_5d[20]:+.1f} pts",
+    ],
+)
+
+# Row 2 — Internal Strength / Volume Participation / Macro Risk / Sector Rotation
+ax_internals = fig_ds.add_subplot(gs_ds[2, 0])
+draw_status_card(
+    ax_internals, "INTERNAL STRENGTH", internals_status,
+    f"TRIN {latest_trin:.2f}  |  McClellan {latest_mcclellan:+.0f}",
+    [
+        f"New Highs/Lows: {latest_highs} / {latest_lows}",
+        f"Advancers/Decliners: {latest_adv} / {latest_dec}",
+    ],
+)
+
+ax_volp = fig_ds.add_subplot(gs_ds[2, 1])
+draw_status_card(
+    ax_volp, "VOLUME PARTICIPATION", volume_status,
+    f"Up-Volume Share: {latest_upvol_pct:.0f}%",
+    [
+        f"Up/Down Vol Ratio: {latest_ud_ratio:.2f}",
+        f"SPY Relative Volume: {spy_rvol:.2f}x",
+    ],
+)
+
+ax_macro = fig_ds.add_subplot(gs_ds[2, 2])
+yc_line = (
+    f"10Y-3M Spread: {yield_curve_spread:+.2f} pts" if not np.isnan(yield_curve_spread) else "10Y-3M Spread: N/A"
+)
+pc_line = f"Put/Call: {last_putcall:.2f}" if not np.isnan(last_putcall) else "Put/Call: N/A"
+draw_status_card(
+    ax_macro, "MACRO / RISK", macro_status,
+    yield_curve_status,
+    [yc_line, pc_line],
+)
+
+ax_rot = fig_ds.add_subplot(gs_ds[2, 3])
+draw_status_card(
+    ax_rot, "SECTOR ROTATION", rotation_status,
+    f"{sector_emergence_counts['green']} Leading / {sector_emergence_counts['yellow']} Neutral / "
+    f"{sector_emergence_counts['red']} Lagging",
+    [
+        f"Top: {ranked_for_summary[0][1]['sector_name']}" if ranked_for_summary else "",
+        f"Weakest: {ranked_for_summary[-1][1]['sector_name']}" if ranked_for_summary else "",
+    ],
+)
+
+# Row 3 — sector-by-sector status bars, colored green/yellow/red by emergence
+# label rather than plain sign, full width — same bars-per-sector layout as
+# the RS charts elsewhere in this script.
+ax_secbar = fig_ds.add_subplot(gs_ds[3, :])
+sec_labels = [f"{etf} · {stats['sector_name']}" for etf, stats in ranked_for_summary]
+sec_values = [stats["emergence_score"] for _, stats in ranked_for_summary]
+sec_colors = []
+for _etf, stats in ranked_for_summary:
+    if stats["emergence"] in ("EMERGING", "LEADING"):
+        sec_colors.append(STATUS_FG["green"])
+    elif stats["emergence"] in ("LAGGING", "WEAKENING"):
+        sec_colors.append(STATUS_FG["red"])
+    else:
+        sec_colors.append("#c9a600")
+
+y_pos = np.arange(len(sec_labels))
+ax_secbar.barh(y_pos, sec_values, color=sec_colors)
+ax_secbar.axvline(0, color="black", linewidth=0.8)
+ax_secbar.set_yticks(y_pos)
+ax_secbar.set_yticklabels(sec_labels, fontsize=10)
+ax_secbar.invert_yaxis()
+ax_secbar.set_xlabel("Emergence Score (higher = stronger short-term rotation into the sector)")
+ax_secbar.set_title(
+    "Sector Status — Green = Leading, Yellow = Neutral, Red = Lagging", fontweight="bold", fontsize=13
+)
+ax_secbar.grid(axis="x", alpha=0.3)
+for i, (etf, stats) in enumerate(ranked_for_summary):
+    val = stats["emergence_score"]
+    ax_secbar.text(
+        val + (0.15 if val >= 0 else -0.15),
+        i,
+        stats["emergence"],
+        va="center",
+        ha="left" if val >= 0 else "right",
+        fontsize=8,
+        fontweight="bold",
+        color=sec_colors[i],
+    )
+
+fig_ds.text(
+    0.01, 0.005,
+    "Green = supportive for a bullish/long-biased decision. Yellow = mixed, wait for confirmation. "
+    "Red = caution/defensive. Not investment advice.",
+    fontsize=8.5, color="#777777",
+)
+
+save_current_figure(fig_ds, "00_decision_summary.png", "Market Decision Summary")
+
+# ============================================================
 # DASHBOARD FIGURE
 # ============================================================
 #
@@ -1088,9 +1336,21 @@ def plot_spy_4panel_block(df_tf, tf, row_start, shared_ref=None, apply_label_hid
     ax_m.plot(df_tf.index, df_tf["MACD"], color="blue", linewidth=1.1, label="MACD")
     ax_m.plot(df_tf.index, df_tf["Signal"], color="red", linewidth=1.1, label="Signal")
     hist = df_tf["MACD"] - df_tf["Signal"]
+    hist_diff = hist.diff()
+    # Bar color = momentum direction, not sign: green when this bar is HIGHER
+    # than the previous bar (histogram expanding/rising), red when it's LOWER
+    # (histogram contracting/falling) — applies the same way whether the
+    # histogram itself is above or below zero. The first bar has no prior bar
+    # to compare against, so it falls back to its own sign.
+    bar_colors = []
+    for i, d in enumerate(hist_diff):
+        if pd.isna(d):
+            bar_colors.append("green" if hist.iloc[i] >= 0 else "red")
+        else:
+            bar_colors.append("green" if d >= 0 else "red")
     bar_width = pd.Timedelta(days=SPY_PANEL_BAR_WIDTH_MAP.get(interval, 0.6))
-    ax_m.bar(df_tf.index, hist, width=bar_width, color=["green" if v >= 0 else "red" for v in hist], alpha=0.4)
-    ax_m.set_title(f"SPY {tf} MACD", loc="left")
+    ax_m.bar(df_tf.index, hist, width=bar_width, color=bar_colors, alpha=0.5)
+    ax_m.set_title(f"SPY {tf} MACD (bar color = rising vs falling momentum)", loc="left")
     ax_m.legend(fontsize=7, loc="upper left")
     ax_m.grid(alpha=0.3)
     block_axes.append(ax_m)

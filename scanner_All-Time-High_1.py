@@ -52,7 +52,7 @@ SECTOR_ETF_MAP = {
 # EMAIL SETTINGS
 # ============================================================
 
-SCANNER_NAME = "Scanner_All-Time-High"   # used in the email subject line
+SCANNER_NAME = "ATH Scanner"   # used in the email subject line
 
 EMAIL_USER = os.environ.get("EMAIL_USER")   # sending gmail address
 EMAIL_PASS = os.environ.get("EMAIL_PASS")   # gmail app password
@@ -256,41 +256,57 @@ def main():
             out = out[out["Stoch_Bull"] == FILTER_REQUIRE_STOCH_BULL]
 
     # ------------------------------------------------------------
-    # Build console + email output
+    # Build read-friendly console + email output
     # ------------------------------------------------------------
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = datetime.now().strftime("%b %d, %Y")   # e.g. "Sep 21, 2026"
+    ticker_count = len(out)
 
     lines = []
-    lines.append(f"NEW ALL-TIME CLOSING HIGHS - LAST {LOOKBACK_DAYS} BUSINESS DAYS ({today_str})")
+    lines.append("=" * 60)
+    lines.append(f"  ALL-TIME HIGH SCANNER  -  {today_str}")
+    lines.append("=" * 60)
+    lines.append("")
+    lines.append(f"New closing highs in the last {LOOKBACK_DAYS} trading days.")
     if FILTERS_ACTIVE:
-        lines.append(f"({len(out)} of {total_before_filters} results passed the active filters)")
-    lines.append("=" * 70)
+        lines.append(f"Filters applied: {ticker_count} of {total_before_filters} candidates passed.")
+    lines.append("")
 
     if out.empty:
+        lines.append("-" * 60)
         if total_before_filters > 0 and FILTERS_ACTIVE:
-            lines.append(f"No tickers passed the active filters ({total_before_filters} made a new ATH before filtering).")
+            lines.append(f"No tickers passed the active filters.")
+            lines.append(f"({total_before_filters} made a new ATH before filtering.)")
         else:
             lines.append("No tickers made a new all-time closing high in this window.")
+        lines.append("-" * 60)
     else:
-        for _, r in out.iterrows():
-            lines.append(
-                f"{r['Ticker']} ({r['Company']}, {r['Sector_ETF']}) - "
-                f"High: {r[f'{LOOKBACK_DAYS}D_High_Close']}, "
-                f"Days Since ATH: {r['Days_Since_ATH']}, "
-                f"Return: {r['Today_Return%']}%, "
-                f"RVOL: {r['RVOL']}, RSI: {r['RSI']}, "
-                f"MACD Bull: {r['MACD_Bull']}, Stoch Bull: {r['Stoch_Bull']}"
-            )
+        for i, (_, r) in enumerate(out.iterrows(), start=1):
+            macd_flag = "Bullish" if r["MACD_Bull"] else "Bearish"
+            stoch_flag = "Bullish" if r["Stoch_Bull"] else "Bearish"
+
+            lines.append("-" * 60)
+            lines.append(f"{i}. {r['Ticker']} - {r['Company']}")
+            lines.append(f"   Sector ETF:        {r['Sector_ETF']}")
+            lines.append(f"   {LOOKBACK_DAYS}D High Close:    ${r[f'{LOOKBACK_DAYS}D_High_Close']}")
+            lines.append(f"   Days Since ATH:    {r['Days_Since_ATH']}")
+            lines.append(f"   Today's Return:    {r['Today_Return%']}%")
+            lines.append(f"   Relative Volume:   {r['RVOL']}x")
+            lines.append(f"   RSI:               {r['RSI']}")
+            lines.append(f"   MACD:              {macd_flag}")
+            lines.append(f"   Stochastic:        {stoch_flag}")
+        lines.append("-" * 60)
+
+    lines.append("")
+    lines.append("=" * 60)
 
     body = "\n".join(lines)
     print(body)
 
-    ticker_count = len(out)
     if ticker_count > 0:
         ticker_list = ", ".join(out["Ticker"].tolist())
-        subject = f"{SCANNER_NAME}: {ticker_count} hit(s) - {ticker_list} - {today_str}"
+        subject = f"{SCANNER_NAME}: {ticker_count} new ATH{'s' if ticker_count != 1 else ''} ({ticker_list}) - {today_str}"
     else:
-        subject = f"{SCANNER_NAME}: No hits - {today_str}"
+        subject = f"{SCANNER_NAME}: No new ATHs - {today_str}"
 
     send_email(subject, body)
 

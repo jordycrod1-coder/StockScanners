@@ -42,6 +42,7 @@ import matplotlib.gridspec as gridspec
 from matplotlib.collections import LineCollection
 import numpy as np
 import pandas as pd
+import pytz
 import requests
 import yfinance as yf
 
@@ -2408,6 +2409,337 @@ plot_sector_strength_chart(
     filename="06_sector_daily.png",
     daily_mode=True,
 )
+
+
+# ============================================================
+# SECTION: TICKER SPOTLIGHT (single-ticker deep dive)
+# ============================================================
+# Ported from the standalone "Ticker Indicator Graph DWM" notebook: a
+# Daily / Weekly / Monthly grid (rows) x Price+Volume / MACD / RSI+Stochastic
+# / MFI+CMF (columns) for one ticker. Reuses this script's own
+# calculate_rsi / calculate_macd / calculate_stochastic / calculate_mfi /
+# calculate_cmf and SPY_PANEL_BAR_WIDTH_MAP, and saves to OUTPUT_DIR instead
+# of plt.show() so it becomes its own card on the Pages site.
+#
+# MACD histogram bars use the same convention as the SPY panels above: green
+# when a bar is higher than the PREVIOUS bar (rising momentum), red when
+# lower (falling) — not simply green-above-zero / red-below-zero.
+# ============================================================
+
+TICKER_SPOTLIGHT = "TSLA"   # change this to switch which single ticker gets its own section
+SPOTLIGHT_DISPLAY_TZ = "US/Central"
+SPOTLIGHT_MARKET_TZ = "US/Eastern"
+
+SPOTLIGHT_TIMEFRAMES = [
+    ("Daily", "1y", "1d"),
+    ("Weekly", "5y", "1wk"),
+    ("Monthly", "6y", "1mo"),
+]
+
+
+def _download_ohlc_tz(ticker, period, interval, market_tz):
+    data = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+    if data is None or data.empty:
+        return None
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+    data = data.rename(columns=str.title)
+    if data.index.tz is None:
+        data.index = data.index.tz_localize(market_tz)
+    else:
+        data.index = data.index.tz_convert(market_tz)
+    if interval in ["1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"]:
+        data = data.between_time("09:30", "16:00")
+    return data
+
+
+def fetch_ticker_timeframe(ticker, period, interval, min_rows=2, market_tz=SPOTLIGHT_MARKET_TZ):
+    data = _download_ohlc_tz(ticker, period, interval, market_tz)
+
+    # A fixed lookback (e.g. '6y' monthly) can come back too thin for a ticker
+    # with a shorter actual trading history (a recent IPO/spinoff) — retry with
+    # 'max' rather than silently dropping the timeframe.
+    if (data is None or len(data) < min_rows) and period != "max":
+        fallback = _download_ohlc_tz(ticker, "max", interval, market_tz)
+        if fallback is not None and len(fallback) >= (len(data) if data is not None else 0):
+            data = fallback
+
+    if data is None:
+        return None
+
+    macd_line, signal_line = calculate_macd(data["Close"])
+    data["MACD"] = macd_line
+    data["Signal"] = signal_line
+    data["RSI"] = calculate_rsi(data["Close"], period=14)
+    data = calculate_stochastic(data, k_period=14, d_period=3, smooth_k=3)
+    data["MFI"] = calculate_mfi(data, period=14)
+    data["CMF"] = calculate_cmf(data, period=20)
+
+    # Only require a valid Close — dropping every row until ALL indicators are
+    # warmed up (CMF needs 20 bars) can wipe out a short-history ticker entirely.
+    data = data.dropna(subset=["Close"])
+    if len(data) < min_rows:
+        return None
+    return data
+
+
+def to_tz(df, display_tz):
+    out = df.copy()
+    if out.index.tz is not None:
+        out.index = out.index.tz_convert(display_tz)
+    return out
+
+
+def plot_price_volume_panel(ax, df, interval, title, display_tz):
+    df_plot = to_tz(df, display_tz)
+    ax.plot(df_plot.index, df_plot["Close"], color="black")
+    ax.set_ylabel("Price ($)")
+    ax.grid(True)
+
+    ax2 = ax.twinx()
+    x = np.asarray(mdates.date2num(df_plot.index.to_pydatetime())).flatten()
+    y = np.asarray((df_plot["Volume"] / 1_000_000).fillna(0)).flatten()
+    bar_width = SPY_PANEL_BAR_WIDTH_MAP.get(interval, 0.5)
+
+    closes = df_plot["Close"].astype(float).values
+    opens = df_plot["Open"].astype(float).values
+    colors = [
+        "green" if (not np.isnan(closes[i]) and closes[i] > opens[i]) else "red"
+        for i in range(len(df_plot))
+    ]
+    ax2.bar(x, y, width=bar_width, color=colors, alpha=0.3)
+    ax2.set_ylabel("Volume (M)")
+
+    max_vol = max(y) if len(y) > 0 else 1
+    ax2.set_ylim(0, max_vol * 1.2)
+    ax2.set_yticks(np.linspace(0, max_vol * 1.2, 6))
+    ax2.set_yticklabels([f"{v:.1f}M" for v in ax2.get_yticks()])
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d\n%Y", tz=pytz.timezone(display_tz)))
+    ax.tick_params(axis="x", rotation=45, labelsize=7)
+    ax.set_title(title, fontsize=10)
+
+
+def plot_macd_panel(ax, df_plot, interval, title, display_tz):
+    ax.plot(df_plot.index, df_plot["MACD"], label="MACD", color="blue", linewidth=1.2)
+    ax.plot(df_plot.index, df_plot["Signal"], label="Signal", color="red", linewidth=1.2)
+    hist = df_plot["MACD"] - df_plot["Signal"]
+    bar_width = pd.Timedelta(days=SPY_PANEL_BAR_WIDTH_MAP.get(interval, 0.6))
+
+    # Bar color = momentum direction vs. the PREVIOUS bar (rising = green,
+    # falling = red) — same convention as the SPY MACD panels earlier in this
+    # script, applied here for Daily/Weekly/Monthly alike.
+    hist_vals = hist.values
+    bar_colors = [
+        "green" if (i == 0 or pd.isna(hist_vals[i - 1]) or hist_vals[i] >= hist_vals[i - 1]) else "red"
+        for i in range(len(hist_vals))
+    ]
+    ax.bar(df_plot.index, hist, width=bar_width, color=bar_colors, alpha=0.5, label="Histogram")
+
+    ax.set_title(title, fontsize=10)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d\n%Y", tz=pytz.timezone(display_tz)))
+    ax.tick_params(axis="x", rotation=45, labelsize=7)
+    ax.grid(True)
+    ax.legend(fontsize=7)
+
+
+def plot_osc_panel(ax, df_plot, title, display_tz):
+    ax.plot(df_plot.index, df_plot["RSI"], label="RSI", color="teal", linewidth=1.4)
+    ax.plot(df_plot.index, df_plot["%K"], label="Stoch %K", color="purple", linewidth=1.0)
+    ax.plot(df_plot.index, df_plot["%D"], label="Stoch %D", color="gold", linewidth=1.0, alpha=0.15)
+
+    ax.fill_between(df_plot.index, df_plot["RSI"], 50, where=(df_plot["RSI"] > 50),
+                     interpolate=True, color="lightgreen", alpha=0.3)
+    ax.fill_between(df_plot.index, df_plot["%K"], 60, where=(df_plot["%K"] > 60),
+                     interpolate=True, color="violet", alpha=0.3)
+
+    ax.axhline(70, color="red", linestyle="--", alpha=0.4)
+    ax.axhline(30, color="green", linestyle="--", alpha=0.4)
+    ax.axhline(80, color="red", linestyle=":", alpha=0.4)
+    ax.axhline(20, color="green", linestyle=":", alpha=0.4)
+
+    ax.set_title(title, fontsize=10)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d\n%Y", tz=pytz.timezone(display_tz)))
+    ax.tick_params(axis="x", rotation=45, labelsize=7)
+    ax.grid(True)
+    ax.legend(fontsize=7)
+    ax.set_ylim(0, 100)
+
+
+def plot_mfi_cmf_panel(ax_mfi, df_plot, title, display_tz):
+    ax_mfi.plot(df_plot.index, df_plot["MFI"], label="MFI (14)", color="darkviolet", linewidth=1.2)
+    ax_mfi.axhline(80, color="red", linestyle="--", alpha=0.6)
+    ax_mfi.axhline(20, color="green", linestyle="--", alpha=0.6)
+    ax_mfi.axhline(50, color="gray", linestyle=":", alpha=0.4)
+    ax_mfi.set_ylim(0, 100)
+    ax_mfi.set_ylabel("MFI", color="darkviolet", fontsize=8)
+    ax_mfi.tick_params(axis="y", labelcolor="darkviolet", labelsize=7)
+
+    ax_cmf = ax_mfi.twinx()
+    ax_cmf.plot(df_plot.index, df_plot["CMF"], label="CMF (20)", color="teal", linewidth=1.2)
+    ax_cmf.axhline(0, color="black", linestyle="-", alpha=0.5)
+    ax_cmf.set_ylim(-1, 1)
+    ax_cmf.set_ylabel("CMF", color="teal", fontsize=8)
+    ax_cmf.tick_params(axis="y", labelcolor="teal", labelsize=7)
+
+    mfi_norm = (df_plot["MFI"] - 50) / 50
+    fill_condition = (mfi_norm > 0) & (df_plot["CMF"] > 0)
+    ax_cmf.fill_between(df_plot.index, mfi_norm, df_plot["CMF"], where=fill_condition,
+                         interpolate=True, color="limegreen", alpha=0.3)
+
+    lines1, labels1 = ax_mfi.get_legend_handles_labels()
+    lines2, labels2 = ax_cmf.get_legend_handles_labels()
+    ax_mfi.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=7)
+
+    ax_mfi.set_title(title, fontsize=10)
+    ax_mfi.xaxis.set_major_formatter(mdates.DateFormatter("%b %d\n%Y", tz=pytz.timezone(display_tz)))
+    ax_mfi.tick_params(axis="x", rotation=45, labelsize=7)
+    ax_mfi.grid(True, alpha=0.3)
+
+
+def generate_ticker_spotlight(ticker):
+    print(f"\nGenerating ticker spotlight for {ticker}...")
+    datasets = []
+    for label, period, interval in SPOTLIGHT_TIMEFRAMES:
+        df = fetch_ticker_timeframe(ticker, period, interval)
+        if df is None or df.empty:
+            print(f"  Note: {label} timeframe has no usable data for {ticker} — skipping.")
+            continue
+        datasets.append((label, interval, df))
+
+    if not datasets:
+        print(f"  No data available for {ticker} — skipping ticker spotlight section.")
+        return
+
+    fig_t, axs_t = plt.subplots(len(datasets), 4, figsize=(30, 4.2 * len(datasets)), squeeze=False)
+
+    for i, (label, interval, df) in enumerate(datasets):
+        df_plot = to_tz(df, SPOTLIGHT_DISPLAY_TZ)
+        plot_price_volume_panel(axs_t[i, 0], df, interval, f"{ticker} {label} Close & Volume", SPOTLIGHT_DISPLAY_TZ)
+        plot_macd_panel(axs_t[i, 1], df_plot, interval, f"{label} MACD", SPOTLIGHT_DISPLAY_TZ)
+        plot_osc_panel(axs_t[i, 2], df_plot, f"{label} RSI + Stochastic", SPOTLIGHT_DISPLAY_TZ)
+        plot_mfi_cmf_panel(axs_t[i, 3], df_plot, f"{label} MFI + CMF", SPOTLIGHT_DISPLAY_TZ)
+
+    fig_t.suptitle(f"{ticker} — Daily / Weekly / Monthly Indicator Spotlight", fontsize=16, fontweight="bold", y=1.01)
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    save_current_figure(fig_t, f"07_ticker_spotlight_{ticker.lower()}.png", f"{ticker} Ticker Spotlight")
+
+
+generate_ticker_spotlight(TICKER_SPOTLIGHT)
+
+
+# ============================================================
+# SECTION: SECTOR INDICATOR GRID (all 11 sectors x Daily/Weekly/Monthly)
+# ============================================================
+# Ported from the standalone "Sectors_IND_GRA_DWM" notebook: all 11 sector
+# SPDR ETFs as columns (sorted by latest weekly return, strongest first),
+# stacked Daily / Weekly / Monthly blocks as rows (4 rows per block —
+# Price+Volume, MACD, RSI+Stochastic, MFI+CMF). Reuses SECTOR_ETFS and the
+# same panel-plotting helpers as the ticker spotlight above, and the same
+# rising/falling MACD histogram coloring convention.
+# ============================================================
+
+SECTOR_GRID_TIMEFRAMES = [
+    ("Daily", "1y", "1d"),
+    ("Weekly", "6y", "1wk"),
+    ("Monthly", "7y", "1mo"),
+]
+SECTOR_GRID_COL_WIDTH_INCHES = 8.0
+SECTOR_GRID_ROW_HEIGHT_INCHES = 4.2
+
+
+def fetch_sector_grid_timeframe(ticker, period, interval, market_tz=SPOTLIGHT_MARKET_TZ):
+    data = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+    if data is None or data.empty:
+        return None
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+    data = data.rename(columns=str.title)
+    if data.index.tz is None:
+        data.index = data.index.tz_localize(market_tz)
+    else:
+        data.index = data.index.tz_convert(market_tz)
+
+    macd_line, signal_line = calculate_macd(data["Close"])
+    data["MACD"] = macd_line
+    data["Signal"] = signal_line
+    data["RSI"] = calculate_rsi(data["Close"], period=14)
+    data = calculate_stochastic(data, k_period=14, d_period=3, smooth_k=3)
+    data["MFI"] = calculate_mfi(data, period=14)
+    data["CMF"] = calculate_cmf(data, period=20)
+    return data.dropna()
+
+
+def generate_sector_indicator_grid():
+    print("\nGenerating sector indicator grid (Daily/Weekly/Monthly x all sectors)...")
+
+    all_grid_data = {}  # {timeframe_label: {etf: df}}
+    for label, period, interval in SECTOR_GRID_TIMEFRAMES:
+        print(f"  Downloading {label} data ({period}, interval={interval}) for {len(SECTOR_ETFS)} sector ETFs...")
+        tf_data = {}
+        for etf in SECTOR_ETFS:
+            df = fetch_sector_grid_timeframe(etf, period, interval)
+            if df is not None and not df.empty:
+                tf_data[etf] = df
+            else:
+                print(f"    Skipped {etf} ({label}) — no data returned")
+        all_grid_data[label] = tf_data
+
+    # Sort sectors by latest weekly return, largest to smallest — same order
+    # applies to all three stacked timeframe blocks
+    weekly_returns = {}
+    for etf in SECTOR_ETFS:
+        df_w = all_grid_data.get("Weekly", {}).get(etf)
+        if df_w is not None and len(df_w) >= 2:
+            weekly_returns[etf] = float((df_w["Close"].iloc[-1] / df_w["Close"].iloc[-2] - 1) * 100)
+        else:
+            weekly_returns[etf] = float("-inf")
+
+    sector_order = sorted(SECTOR_ETFS.items(), key=lambda kv: weekly_returns[kv[0]], reverse=True)
+    n_sectors = len(sector_order)
+    n_tf = len(SECTOR_GRID_TIMEFRAMES)
+
+    if n_sectors == 0:
+        print("  No sector data available — skipping sector indicator grid.")
+        return
+
+    fig_s, axs_s = plt.subplots(
+        4 * n_tf, n_sectors,
+        figsize=(SECTOR_GRID_COL_WIDTH_INCHES * n_sectors, SECTOR_GRID_ROW_HEIGHT_INCHES * 4 * n_tf),
+        squeeze=False,
+    )
+
+    for t, (label, period, interval) in enumerate(SECTOR_GRID_TIMEFRAMES):
+        row_price = t * 4 + 0
+        row_macd = t * 4 + 1
+        row_osc = t * 4 + 2
+        row_mfi = t * 4 + 3
+
+        for j, (etf, sector_name) in enumerate(sector_order):
+            df = all_grid_data[label].get(etf)
+            if df is None:
+                for r in (row_price, row_macd, row_osc, row_mfi):
+                    axs_s[r, j].set_title(f"{etf} — no data ({label})", fontsize=10)
+                    axs_s[r, j].axis("off")
+                continue
+
+            df_plot = to_tz(df, SPOTLIGHT_DISPLAY_TZ)
+            wr = weekly_returns.get(etf, float("-inf"))
+            wr_label = f" [Wk: {wr:+.2f}%]" if wr != float("-inf") else ""
+
+            plot_price_volume_panel(
+                axs_s[row_price, j], df, interval, f"{etf} — {sector_name} ({label}){wr_label}", SPOTLIGHT_DISPLAY_TZ
+            )
+            plot_macd_panel(axs_s[row_macd, j], df_plot, interval, f"{etf} MACD ({label})", SPOTLIGHT_DISPLAY_TZ)
+            plot_osc_panel(axs_s[row_osc, j], df_plot, f"{etf} RSI + Stochastic ({label})", SPOTLIGHT_DISPLAY_TZ)
+            plot_mfi_cmf_panel(axs_s[row_mfi, j], df_plot, f"{etf} MFI + CMF ({label})", SPOTLIGHT_DISPLAY_TZ)
+
+    fig_s.suptitle("S&P 500 Sector Comparison — Daily / Weekly / Monthly", fontsize=16, fontweight="bold", y=1.002)
+    plt.tight_layout(rect=[0, 0, 1, 0.99])
+    save_current_figure(fig_s, "08_sector_indicator_grid.png", "Sector Indicator Grid (Daily/Weekly/Monthly)")
+
+
+generate_sector_indicator_grid()
 
 
 # ============================================================

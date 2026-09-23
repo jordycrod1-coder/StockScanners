@@ -2,11 +2,15 @@
 ATH Scanner - 12-month backtest visual
 ======================================
 
-Replays the All-Time-High scanner (same signal + same filters) on every trading
-day over the last N months, then builds an interactive HTML report with:
+Replays the All-Time-High scanner on every trading day over the last N months and
+builds an interactive HTML report. Every new-ATH candidate is stored; the scanner's
+filters (RSI, RVOL, days since ATH, today's return, MACD, Stochastic) are applied
+live in the page, starting from your live scanner's settings, so you can test
+other values. Also filters by sector, ticker, and positive/negative forward return.
 
-  1. Daily stacked bar  - number of tickers that passed the scanner each day
+  1. Daily stacked bar  - number of tickers passing the filters each day
   2. Weekly stacked bar - sum of daily hits per week (Mon-Fri)
+  3. Forward returns by sector + most frequent tickers (update with the filters)
 
 Each bar is split into segments, one per ticker, labeled with the ticker symbol.
 Segment color = forward return after the hit (default 10 trading days):
@@ -15,7 +19,8 @@ Hits too recent to have a forward result yet are shown hatched.
 
 Outputs (written next to this script):
   ath_backtest_report.html  - open in any browser (zoom in to reveal labels)
-  ath_backtest_hits.csv     - every hit with indicators + forward returns
+  ath_backtest_hits.csv     - every ATH candidate with indicators, forward returns,
+                              and a Passes_Scanner_Filters flag
 
 Requires: pip install yfinance pandas requests plotly lxml
 """
@@ -28,7 +33,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
+from plotly.offline import get_plotlyjs, get_plotlyjs_version
 import requests
 import yfinance as yf
 
@@ -196,6 +201,7 @@ def scan_history(full_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
+    """The live scanner's filters (used for the page defaults and the CSV flag)."""
     out = df[df["Is_New_ATH"]]
     if not FILTERS_ACTIVE:
         return out
@@ -217,7 +223,13 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_backtest(data, sp500: pd.DataFrame, start: pd.Timestamp):
-    hits, all_days = [], set()
+    """Every (day, ticker) with a new all-time closing high in the lookback window.
+
+    The indicator filters are NOT applied here - the report applies them live so
+    they can be changed in the page. 'Passes_Scanner_Filters' marks the rows that
+    pass the live scanner's current settings.
+    """
+    cands, all_days = [], set()
 
     for _, row in sp500.iterrows():
         t = row["Ticker"]
@@ -232,430 +244,539 @@ def run_backtest(data, sp500: pd.DataFrame, start: pd.Timestamp):
         hist = hist[hist.index >= start]
         all_days.update(hist.index)
 
-        passed = apply_filters(hist)
-        if passed.empty:
+        ath = hist[hist["Is_New_ATH"]]
+        if ath.empty:
             continue
-        passed = passed.copy()
-        passed.insert(0, "Ticker", t)
-        passed.insert(1, "Company", row["Company"])
-        passed.insert(2, "Sector_ETF", row["Sector_ETF"])
-        passed.insert(3, "Sector", row["Sector"])
-        hits.append(passed)
+        ath = ath.copy()
+        ath["Passes_Scanner_Filters"] = ath.index.isin(apply_filters(hist).index)
+        ath.insert(0, "Ticker", t)
+        ath.insert(1, "Company", row["Company"])
+        ath.insert(2, "Sector_ETF", row["Sector_ETF"])
+        ath.insert(3, "Sector", row["Sector"])
+        cands.append(ath)
 
     trading_days = pd.DatetimeIndex(sorted(all_days))
-    if not hits:
+    if not cands:
         return pd.DataFrame(), trading_days
 
-    hits = pd.concat(hits)
-    hits.index.name = "Date"
-    hits = hits.reset_index().drop(columns=["Is_New_ATH"])
-    hits["Days_Since_ATH"] = hits["Days_Since_ATH"].astype(int)
-    return hits.sort_values(["Date", "Ticker"]).reset_index(drop=True), trading_days
+    cands = pd.concat(cands)
+    cands.index.name = "Date"
+    cands = cands.reset_index().drop(columns=["Is_New_ATH"])
+    cands["Days_Since_ATH"] = cands["Days_Since_ATH"].astype(int)
+    return cands.sort_values(["Date", "Ticker"]).reset_index(drop=True), trading_days
 
 
 # ============================================================
-# CHARTS
+# REPORT (charts + tables are drawn in the browser from the data)
 # ============================================================
 
-def _hex_to_rgb(h):
-    return tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))
+def _col(series, nd=2):
+    """Series -> JSON-friendly list (NaN -> null)."""
+    return [None if pd.isna(v) else round(float(v), nd) for v in series]
 
 
-def fwd_color(v):
-    """Forward return % -> hex color on the red/gray/green gradient (None/NaN -> pending)."""
-    if v is None or pd.isna(v):
-        return PENDING_COLOR
-    x = max(-1.0, min(1.0, float(v) / COLOR_CAP_PCT))
-    for (p0, c0), (p1, c1) in zip(GRADIENT, GRADIENT[1:]):
-        if x <= p1:
-            f = (x - p0) / (p1 - p0)
-            r0, r1 = _hex_to_rgb(c0), _hex_to_rgb(c1)
-            return "#%02x%02x%02x" % tuple(round(a + (b - a) * f) for a, b in zip(r0, r1))
-    return GRADIENT[-1][1]
+def build_report(cands: pd.DataFrame, trading_days: pd.DatetimeIndex, start, end):
+    dates = sorted(cands["Date"].dt.strftime("%Y-%m-%d").unique())
+    date_ix = {d: i for i, d in enumerate(dates)}
+    tickers = sorted(cands["Ticker"].unique())
+    tick_ix = {t: i for i, t in enumerate(tickers)}
+    first = cands.drop_duplicates("Ticker").set_index("Ticker")
 
-
-def label_color(v):
-    """Dark text on the light middle of the scale, white text on saturated ends."""
-    if v is None or pd.isna(v) or abs(v) / COLOR_CAP_PCT < 0.4:
-        return INK
-    return "#ffffff"
-
-
-PLOTLY_SCALE = [[(p + 1) / 2, c] for p, c in GRADIENT]
-
-
-def stacked_bar(frame: pd.DataFrame, x_col: str, y_col: str, x_all, title: str,
-                hover_fmt: str, totals: pd.Series, unique: pd.Series, bar_width_ms=None,
-                annotate_totals=False):
-    """frame needs a 'Color_Val' column: the forward return % used for the segment color."""
-    fig = go.Figure()
-    # tickers with the best average forward return sit at the bottom of the stacks
-    order = frame.groupby("Ticker")["Color_Val"].mean().sort_values(ascending=False, na_position="last")
-
-    for t in order.index:
-        sub = frame[frame["Ticker"] == t]
-        vals = sub["Color_Val"].tolist()
-        fig.add_bar(
-            x=sub[x_col], y=sub[y_col], name=t, showlegend=False,
-            marker=dict(
-                color=[fwd_color(v) for v in vals],
-                line=dict(color=SURFACE, width=0.5),
-                pattern=dict(shape=["/" if pd.isna(v) else "" for v in vals],
-                             fgcolor="#a9a8a2", size=5, solidity=0.25),
-            ),
-            text=sub["Ticker"], textposition="inside", insidetextanchor="middle",
-            textfont=dict(color=[label_color(v) for v in vals], size=10), constraintext="inside",
-            meta={"t": t, "s": str(sub["Sector_ETF"].iloc[0])},
-            customdata=sub[["Ticker", "Company", "Sector_ETF"] + hover_fmt[1]].values,
-            hovertemplate=hover_fmt[0] + "<extra></extra>",
-            width=bar_width_ms,
-        )
-
-    # invisible trace so hovering the empty day still shows 0
-    fig.add_scatter(
-        meta="__total__",
-        x=x_all, y=totals.reindex(x_all, fill_value=0),
-        mode="markers", marker=dict(opacity=0, size=1), showlegend=False,
-        customdata=np.stack([unique.reindex(x_all, fill_value=0)], axis=-1),
-        hovertemplate="<b>%{x|%b %d, %Y}</b><br>Total hits: %{y}<br>Unique tickers: %{customdata[0]}<extra></extra>",
-    )
-
-    # color scale key (a hidden point that only exists to draw the colorbar)
-    fig.add_scatter(
-        meta="__scale__", x=[x_all[0]], y=[0], mode="markers", hoverinfo="skip", showlegend=False,
-        marker=dict(size=0.1, opacity=0, color=[0], colorscale=PLOTLY_SCALE,
-                    cmin=-COLOR_CAP_PCT, cmax=COLOR_CAP_PCT, showscale=True,
-                    colorbar=dict(orientation="h", x=1, xanchor="right", y=1.03, yanchor="bottom",
-                                  len=0.34, thickness=10, outlinewidth=0,
-                                  tickvals=[-COLOR_CAP_PCT, -COLOR_CAP_PCT / 2, 0,
-                                            COLOR_CAP_PCT / 2, COLOR_CAP_PCT],
-                                  ticktext=[f"≤ -{COLOR_CAP_PCT}%", f"-{COLOR_CAP_PCT / 2:g}%", "0%",
-                                            f"+{COLOR_CAP_PCT / 2:g}%", f"≥ +{COLOR_CAP_PCT}%"],
-                                  title=dict(text=f"{COLOR_FWD_DAYS}D forward return",
-                                             side="top", font=dict(size=11)),
-                                  tickfont=dict(size=10))),
-    )
-
-    if annotate_totals:
-        for x, v in totals.items():
-            if v > 0:
-                fig.add_annotation(x=x, y=v, text=str(int(v)), showarrow=False, yshift=9,
-                                   font=dict(size=10, color=INK_2))
-
-    fig.update_layout(
-        barmode="stack", bargap=0.18,
-        plot_bgcolor=SURFACE, paper_bgcolor=SURFACE,
-        font=dict(family="Inter, Segoe UI, Arial, sans-serif", color=INK_2, size=12),
-        height=520, margin=dict(l=50, r=20, t=70, b=40), showlegend=False,
-        hoverlabel=dict(bgcolor="#ffffff", font=dict(color=INK)),
-        xaxis=dict(showgrid=False, linecolor=GRID, rangeslider=dict(visible=True, thickness=0.06)),
-        yaxis=dict(gridcolor=GRID, zeroline=False, rangemode="tozero", title=None,
-                   tickformat=",d"),
-    )
-    return fig
-
-
-def build_report(hits: pd.DataFrame, trading_days: pd.DatetimeIndex, start, end):
-    fwd_col = f"Fwd_{COLOR_FWD_DAYS}D%"
-
-    # ---------------- daily ----------------
-    daily = hits.copy()
-    daily["Hit"] = 1
-    daily["Color_Val"] = daily[fwd_col]
-    daily["Fwd_Label"] = daily[fwd_col].map(lambda v: "not yet available" if pd.isna(v) else f"{v:+.2f}%")
-    daily_totals = daily.groupby("Date").size()
-    daily_unique = daily.groupby("Date")["Ticker"].nunique()
-
-    daily_hover = (
-        "<b>%{customdata[0]}</b> - %{customdata[1]}<br>%{x|%b %d, %Y} · %{customdata[2]}<br>"
-        "Days since ATH: %{customdata[3]} · RVOL: %{customdata[4]}x · RSI: %{customdata[5]}<br>"
-        f"<b>{COLOR_FWD_DAYS}D forward return: %{{customdata[6]}}</b>",
-        ["Days_Since_ATH", "RVOL", "RSI", "Fwd_Label"],
-    )
-    fig_daily = stacked_bar(
-        daily, "Date", "Hit", trading_days,
-        "Daily hits - unique tickers passing the scanner each trading day",
-        daily_hover, daily_totals, daily_unique,
-        bar_width_ms=0.8 * 86_400_000,
-    )
-    # hide weekends + market holidays so each trading day gets full bar width
     all_bdays = pd.bdate_range(trading_days.min(), trading_days.max())
     holidays = [d.strftime("%Y-%m-%d") for d in all_bdays.difference(trading_days)]
-    fig_daily.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"]), dict(values=holidays)])
 
-    # ---------------- weekly (sum of daily hits) ----------------
-    hits_w = hits.copy()
-    hits_w["Week"] = hits_w["Date"].dt.to_period("W-FRI").dt.start_time + pd.Timedelta(days=2)
-    weekly = (hits_w.groupby(["Week", "Ticker", "Company", "Sector_ETF"])
-              .agg(Days_Hit=("Date", "size"),
-                   Color_Val=(fwd_col, "mean"),
-                   Dates=("Date", lambda s: ", ".join(d.strftime("%a %m/%d") for d in s)))
-              .reset_index())
-    weekly["Week_Label"] = (weekly["Week"] - pd.Timedelta(days=2)).dt.strftime("%b %d, %Y")
-    weekly["Fwd_Label"] = weekly["Color_Val"].map(lambda v: "not yet available" if pd.isna(v) else f"{v:+.2f}%")
-    weekly_totals = weekly.groupby("Week")["Days_Hit"].sum()
-    weekly_unique = weekly.groupby("Week")["Ticker"].nunique()
-    all_weeks = pd.DatetimeIndex(sorted(set(pd.Series(trading_days).dt.to_period("W-FRI").dt.start_time + pd.Timedelta(days=2))))
-
-    weekly_hover = (
-        "<b>%{customdata[0]}</b> - %{customdata[1]}<br>Week of %{customdata[4]} · %{customdata[2]}<br>"
-        "Days hit this week: %{y}<br>%{customdata[3]}<br>"
-        f"<b>Avg {COLOR_FWD_DAYS}D forward return: %{{customdata[5]}}</b>",
-        ["Dates", "Week_Label", "Fwd_Label"],
-    )
-    fig_weekly = stacked_bar(
-        weekly, "Week", "Days_Hit", all_weeks,
-        "Weekly hits - sum of daily hits per week (segment = days that ticker hit)",
-        weekly_hover, weekly_totals, weekly_unique,
-        bar_width_ms=0.8 * 5 * 86_400_000, annotate_totals=True,
-    )
-    fig_weekly.update_xaxes(tickformat="%b %d")
-
-    # ---------------- summary ----------------
-    n_days = len(trading_days)
-    days_with_hit = daily_totals.index.nunique()
-    top = (hits.groupby(["Ticker", "Company", "Sector_ETF"])
-           .agg(Days=("Date", "size"), Fwd=(fwd_col, "mean"))
-           .sort_values("Days", ascending=False).head(15).reset_index())
-
-    ticker_info = {}
-    for t, g in hits.groupby("Ticker"):
-        ticker_info[t] = {
-            "company": str(g["Company"].iloc[0]),
-            "sector": str(g["Sector_ETF"].iloc[0]),
-            "days": int(len(g)),
-            "first": g["Date"].min().strftime("%b %d, %Y"),
-            "last": g["Date"].max().strftime("%b %d, %Y"),
-            "fwd": {str(n): (None if g[f"Fwd_{n}D%"].dropna().empty
-                             else round(float(g[f"Fwd_{n}D%"].mean()), 2)) for n in FORWARD_DAYS},
-        }
-    sector_info = {}
-    for etf, g in hits.groupby("Sector_ETF"):
-        sector_info[etf] = {
-            "name": str(g["Sector"].iloc[0]) if "Sector" in g else etf,
-            "hits": int(len(g)),
-            "tickers": int(g["Ticker"].nunique()),
-            "fwd": {str(n): (None if g[f"Fwd_{n}D%"].dropna().empty
-                             else round(float(g[f"Fwd_{n}D%"].mean()), 2)) for n in FORWARD_DAYS},
-        }
-    sector_options = "".join(
-        f"<option value='{etf}'>{v['name']} ({etf}) - {v['hits']} hits</option>"
-        for etf, v in sorted(sector_info.items(), key=lambda kv: kv[1]["name"]))
-    # weekly rows, so the page can recompute the weekly totals shown above bars when filtered
-    weekly_rows = [[w.strftime("%Y-%m-%d"), t, sec, int(n)] for w, t, sec, n in
-                   weekly[["Week", "Ticker", "Sector_ETF", "Days_Hit"]].itertuples(index=False)]
-
-    fwd_rows = ""
+    cols = {
+        "d": [date_ix[d] for d in cands["Date"].dt.strftime("%Y-%m-%d")],
+        "t": [tick_ix[t] for t in cands["Ticker"]],
+        "rsi": _col(cands["RSI"], 1),
+        "rvol": _col(cands["RVOL"], 2),
+        "dsa": cands["Days_Since_ATH"].astype(int).tolist(),
+        "ret": _col(cands["Today_Return%"], 2),
+        "macd": cands["MACD_Bull"].astype(int).tolist(),
+        "stoch": cands["Stoch_Bull"].astype(int).tolist(),
+    }
     for n in FORWARD_DAYS:
-        s = hits[f"Fwd_{n}D%"].dropna()
-        if len(s):
-            fwd_rows += (f"<tr><td>{n} trading days</td><td>{len(s):,}</td>"
-                         f"<td>{s.mean():+.2f}%</td><td>{s.median():+.2f}%</td>"
-                         f"<td>{(s > 0).mean() * 100:.0f}%</td></tr>")
+        cols[f"f{n}"] = _col(cands[f"Fwd_{n}D%"], 2)
 
-    top_rows = "".join(
-        f"<tr><td><b>{r.Ticker}</b></td><td>{r.Company}</td><td>{r.Sector_ETF}</td>"
-        f"<td class='num'>{r.Days}</td>"
-        f"<td class='num'><span class='sw' style='background:{fwd_color(r.Fwd)}'></span>"
-        f"{'n/a' if pd.isna(r.Fwd) else f'{r.Fwd:+.2f}%'}</td></tr>" for r in top.itertuples()
-    )
+    def tri(v):  # True -> "bull", False -> "bear", None -> "any"
+        return "any" if v is None else ("bull" if v else "bear")
 
-    filters = [
+    on = FILTERS_ACTIVE
+    defaults = {
+        "rsiMin": FILTER_MIN_RSI if on else None,
+        "rsiMax": FILTER_MAX_RSI if on else None,
+        "rvolMin": FILTER_MIN_RVOL if on else None,
+        "maxDays": FILTER_MAX_DAYS_SINCE_ATH if on else None,
+        "retMin": FILTER_MIN_TODAY_RETURN if on else None,
+        "macd": tri(FILTER_REQUIRE_MACD_BULL) if on else "any",
+        "stoch": tri(FILTER_REQUIRE_STOCH_BULL) if on else "any",
+    }
+
+    data = {
+        "dates": dates,
+        "trading": [d.strftime("%Y-%m-%d") for d in trading_days],
+        "holidays": holidays,
+        "tickers": tickers,
+        "company": {t: str(first.loc[t, "Company"]) for t in tickers},
+        "sector": {t: str(first.loc[t, "Sector_ETF"]) for t in tickers},
+        "sectorName": {str(r.Sector_ETF): str(r.Sector)
+                       for r in cands.drop_duplicates("Sector_ETF").itertuples()},
+        "cols": cols,
+        "fwdDays": FORWARD_DAYS,
+        "colorDays": COLOR_FWD_DAYS,
+        "cap": COLOR_CAP_PCT,
+        "gradient": GRADIENT,
+        "pending": PENDING_COLOR,
+        "defaults": defaults,
+        "lookback": LOOKBACK_DAYS,
+    }
+
+    default_desc = [
         f"new closing high in last {LOOKBACK_DAYS} days",
-        f"days since ATH ≤ {FILTER_MAX_DAYS_SINCE_ATH}" if FILTER_MAX_DAYS_SINCE_ATH is not None else None,
-        f"RVOL ≥ {FILTER_MIN_RVOL}" if FILTER_MIN_RVOL is not None else None,
-        f"today return ≥ {FILTER_MIN_TODAY_RETURN}%" if FILTER_MIN_TODAY_RETURN is not None else None,
-        f"RSI {FILTER_MIN_RSI}-{FILTER_MAX_RSI}" if FILTER_MIN_RSI is not None else None,
-        "MACD bullish" if FILTER_REQUIRE_MACD_BULL else None,
-        "Stochastic bullish" if FILTER_REQUIRE_STOCH_BULL else None,
+        f"days since ATH ≤ {defaults['maxDays']}" if defaults["maxDays"] is not None else None,
+        f"RVOL ≥ {defaults['rvolMin']}" if defaults["rvolMin"] is not None else None,
+        f"today return ≥ {defaults['retMin']}%" if defaults["retMin"] is not None else None,
+        f"RSI {defaults['rsiMin']}-{defaults['rsiMax']}" if defaults["rsiMin"] is not None else None,
+        {"bull": "MACD bullish", "bear": "MACD bearish"}.get(defaults["macd"]),
+        {"bull": "Stochastic bullish", "bear": "Stochastic bearish"}.get(defaults["stoch"]),
     ]
-    filters = " · ".join(f for f in filters if f) if FILTERS_ACTIVE else "filters off"
+    default_desc = " · ".join(x for x in default_desc if x)
 
-    tiles = [
-        (f"{len(hits):,}", "total hits"),
-        (f"{hits['Ticker'].nunique():,}", "unique tickers"),
-        (f"{len(hits) / max(n_days, 1):.1f}", "avg hits / trading day"),
-        (f"{days_with_hit}/{n_days}", "days with ≥1 hit"),
-        (f"{int(daily_totals.max()) if len(daily_totals) else 0}", "busiest day"),
-    ]
-    tiles_html = "".join(f"<div class='tile'><div class='v'>{v}</div><div class='l'>{l}</div></div>"
-                         for v, l in tiles)
+    if PLOTLY_JS == "inline":
+        plotly_tag = f"<script>{get_plotlyjs()}</script>"
+    else:
+        plotly_tag = f'<script src="https://cdn.plot.ly/plotly-{get_plotlyjs_version()}.min.js"></script>'
 
-    html = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>ATH Scanner Backtest</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  body {{ background:{SURFACE}; color:{INK}; font-family:Inter,'Segoe UI',Arial,sans-serif;
-         margin:0; padding:24px 16px; }}
-  .wrap {{ max-width:1280px; margin:0 auto; }}
-  h1 {{ font-size:22px; margin:0 0 4px; }}
-  .sub {{ color:{INK_2}; font-size:13px; margin-bottom:18px; line-height:1.5; }}
-  .tiles {{ display:flex; flex-wrap:wrap; gap:12px; margin-bottom:18px; }}
-  .tile {{ border:1px solid {GRID}; border-radius:8px; padding:10px 16px; min-width:130px; }}
-  .tile .v {{ font-size:22px; font-weight:600; }}
-  .tile .l {{ font-size:12px; color:{INK_2}; }}
-  .card {{ border:1px solid {GRID}; border-radius:10px; padding:8px; margin-bottom:18px; }}
-  .grid2 {{ display:grid; grid-template-columns:1fr 1fr; gap:18px; }}
-  @media (max-width:800px) {{ .grid2 {{ grid-template-columns:1fr; }} }}
-  table {{ border-collapse:collapse; width:100%; font-size:13px; }}
-  th, td {{ text-align:left; padding:6px 8px; border-bottom:1px solid {GRID}; }}
-  th {{ color:{INK_2}; font-weight:500; }}
-  td.num {{ text-align:right; }}
-  h2 {{ font-size:15px; margin:6px 8px 10px; }}
-  .note {{ color:{INK_2}; font-size:12px; margin:8px; line-height:1.5; }}
-  .filter {{ display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-bottom:10px; }}
-  .filter label {{ font-size:13px; color:{INK_2}; }}
-  .filter input {{ font:inherit; font-size:14px; padding:7px 10px; border:1px solid #c9c8c2;
-                   border-radius:6px; width:260px; background:#fff; color:{INK}; }}
-  .filter button {{ font:inherit; font-size:13px; padding:7px 12px; border:1px solid #c9c8c2;
-                    border-radius:6px; background:#fff; color:{INK}; cursor:pointer; }}
-  .filter button:hover {{ background:#f0efec; }}
-  .filter select {{ font:inherit; font-size:14px; padding:7px 10px; border:1px solid #c9c8c2;
-                    border-radius:6px; background:#fff; color:{INK}; max-width:100%; }}
-  .filter .sep {{ width:1px; height:26px; background:{GRID}; margin:0 4px; }}
-  a {{ color:#2a78d6; }}
-  h2.ct {{ font-size:16px; font-weight:600; margin:10px 10px 0; color:{INK}; }}
-  .sw {{ display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:6px;
-         vertical-align:-1px; border:1px solid rgba(0,0,0,.08); }}
-  #tickerSummary {{ font-size:13px; color:{INK_2}; margin-bottom:14px; min-height:18px; line-height:1.6; }}
-  #tickerSummary b {{ color:{INK}; }}
-</style></head><body><div class="wrap">
-<h1>ATH Scanner - {BACKTEST_MONTHS}-month backtest</h1>
-<div class="sub">{start:%b %d, %Y} → {end:%b %d, %Y} · S&amp;P 500 · {filters}<br>
-Each bar segment is one ticker (labeled). Color = {COLOR_FWD_DAYS}-day forward return after the hit:
-red = loss, gray = flat, green = gain, darker green = bigger gain (±{COLOR_CAP_PCT}% or more = darkest).
-Hatched = hit too recent to have a {COLOR_FWD_DAYS}-day result yet. Drag to zoom (or use the slider)
-to reveal labels on the daily chart.</div>
-<div class="tiles">{tiles_html}</div>
-<div class="filter">
-  <label for="sectorSelect">Sector</label>
-  <select id="sectorSelect"><option value="">All sectors</option>{sector_options}</select>
-  <span class="sep"></span>
-  <label for="tickerInput">Tickers</label>
-  <input id="tickerInput" list="tickerList" placeholder="e.g. NVDA  or  NVDA, AVGO, JPM" autocomplete="off">
-  <datalist id="tickerList"></datalist>
-  <button id="applyBtn">Apply</button><button id="clearBtn">Reset</button>
-</div>
-<div id="tickerSummary"></div>
-<div class="card"><h2 class="ct">Daily hits - unique tickers passing the scanner each trading day</h2>{fig_daily.to_html(full_html=False, include_plotlyjs=(True if PLOTLY_JS == 'inline' else 'cdn'), div_id='dailyChart', config={'displaylogo': False})}</div>
-<div class="card"><h2 class="ct">Weekly hits - sum of daily hits per week (segment = days that ticker hit)</h2>{fig_weekly.to_html(full_html=False, include_plotlyjs=False, div_id='weeklyChart', config={'displaylogo': False})}</div>
-<div class="grid2">
-  <div class="card"><h2>Most frequent tickers</h2>
-    <table><tr><th>Ticker</th><th>Company</th><th>Sector</th><th class="num">Days hit</th><th class="num">Avg {COLOR_FWD_DAYS}D fwd</th></tr>{top_rows}</table></div>
-  <div class="card"><h2>Forward returns after a hit (close-to-close)</h2>
-    <table><tr><th>Horizon</th><th>Hits</th><th>Mean</th><th>Median</th><th>% positive</th></tr>{fwd_rows}</table>
-    <div class="note">Recent hits without enough future data are excluded from each horizon.
-    Uses today's S&amp;P 500 members, so names that left the index in the past year are missing
-    (survivorship bias) - treat returns as indicative, not a trading result.
-    <br><a href="{CSV_OUT.name}" download>Download every hit (CSV)</a></div></div>
-</div>
-</div>
-<script>
-const INFO = {json.dumps(ticker_info)};
-const SECTORS = {json.dumps(sector_info)};
-const WEEKLY = {json.dumps(weekly_rows)};
-const FWD = {json.dumps([str(n) for n in FORWARD_DAYS])};
-const charts = ['dailyChart', 'weeklyChart'];
-const input = document.getElementById('tickerInput');
-const sectorSel = document.getElementById('sectorSelect');
-const summary = document.getElementById('tickerSummary');
-let weeklyAnn = null;
+    day_opts = "".join(f"<option value='{i}'>{i}</option>" for i in range(LOOKBACK_DAYS))
 
-function parse(v) {{
-  return v.toUpperCase().split(/[\s,;]+/).map(x => x.replace('.', '-')).filter(Boolean);
-}}
-function pct(v) {{ return v === null ? 'n/a' : (v > 0 ? '+' : '') + v.toFixed(2) + '%'; }}
-function fwdText(f) {{ return FWD.map(n => `${{n}}D ${{pct(f[n])}}`).join(' · '); }}
-
-// ticker suggestions follow the chosen sector
-function fillTickerList() {{
-  const sec = sectorSel.value;
-  document.getElementById('tickerList').innerHTML = Object.keys(INFO).sort()
-    .filter(t => !sec || INFO[t].sector === sec)
-    .map(t => `<option value="${{t}}">${{INFO[t].company}}</option>`).join('');
-}}
-
-function applyFilter() {{
-  const sec = sectorSel.value;
-  const tickers = new Set(parse(input.value));
-  const byTicker = tickers.size > 0;
-  const filtering = byTicker || !!sec;
-  const keep = m => (!sec || m.s === sec) && (!byTicker || tickers.has(m.t));
-
-  charts.forEach(id => {{
-    const g = document.getElementById(id);
-    const vis = g.data.map(tr => tr.meta === '__scale__' ? true
-                               : tr.meta === '__total__' ? !filtering : keep(tr.meta));
-    Plotly.restyle(g, {{visible: vis}});
-
-    const upd = {{'yaxis.autorange': true, 'yaxis.dtick': null}};
-    if (id === 'weeklyChart') {{
-      if (!filtering) upd.annotations = weeklyAnn;
-      else {{
-        const tot = {{}};
-        WEEKLY.forEach(([w, t, s, n]) => {{ if (keep({{t: t, s: s}})) tot[w] = (tot[w] || 0) + n; }});
-        upd.annotations = Object.entries(tot).map(([w, v]) => ({{
-          x: w, y: v, text: String(v), showarrow: false, yshift: 9,
-          font: {{size: 10, color: '{INK_2}'}} }}));
-      }}
-    }}
-    Plotly.relayout(g, upd).then(() => {{
-      // whole-number ticks when counts are small (avoids repeated 1, 1, 2, 2 labels)
-      if (filtering && g._fullLayout.yaxis.range[1] <= 12) Plotly.relayout(g, {{'yaxis.dtick': 1}});
-    }});
-  }});
-
-  const lines = [];
-  if (sec && SECTORS[sec]) {{
-    const s = SECTORS[sec];
-    lines.push(`<b>${{s.name}} (${{sec}})</b> · <b>${{s.hits}}</b> hits · ${{s.tickers}} unique tickers · ` +
-               `avg forward return: ${{fwdText(s.fwd)}}`);
-  }}
-  [...tickers].forEach(t => {{
-    const i = INFO[t];
-    if (!i) lines.push(`<b>${{t}}</b>: no hits in this backtest window (or not an S&amp;P 500 ticker).`);
-    else if (sec && i.sector !== sec) lines.push(`<b>${{t}}</b> is in ${{i.sector}}, not ${{sec}} - clear the sector to see it.`);
-    else lines.push(`<b>${{t}}</b> - ${{i.company}} (${{i.sector}}) · <b>${{i.days}}</b> days hit · ` +
-                    `first ${{i.first}} · last ${{i.last}} · avg forward return: ${{fwdText(i.fwd)}}`);
-  }});
-  summary.innerHTML = lines.join('<br>');
-}}
-
-// when embedded in the dashboard (iframe), tell the parent page how tall this report is
-function postHeight() {{
-  if (window.parent !== window)
-    window.parent.postMessage({{type: 'scanner-height', h: document.documentElement.scrollHeight}}, '*');
-}}
-window.addEventListener('load', postHeight);
-if (window.ResizeObserver) new ResizeObserver(postHeight).observe(document.body);
-
-window.addEventListener('load', () => {{
-  charts.forEach(id => {{
-    const g = document.getElementById(id);
-  }});
-  weeklyAnn = JSON.parse(JSON.stringify(document.getElementById('weeklyChart').layout.annotations || []));
-  fillTickerList();
-  sectorSel.addEventListener('change', () => {{ fillTickerList(); applyFilter(); }});
-  document.getElementById('applyBtn').onclick = applyFilter;
-  document.getElementById('clearBtn').onclick = () => {{
-    input.value = ''; sectorSel.value = ''; fillTickerList(); applyFilter();
-  }};
-  input.addEventListener('keydown', e => {{ if (e.key === 'Enter') applyFilter(); }});
-  input.addEventListener('change', applyFilter);
-}});
-</script>
-</body></html>"""
+    html = (PAGE_TEMPLATE
+            .replace("__PERIOD__", f"{start:%b %d, %Y} → {end:%b %d, %Y}")
+            .replace("__DEFAULTS_DESC__", default_desc)
+            .replace("__DAY_OPTS__", day_opts)
+            .replace("__CSV__", CSV_OUT.name)
+            .replace("__N__", str(COLOR_FWD_DAYS))
+            .replace("__CAP__", f"{COLOR_CAP_PCT:g}")
+            .replace("__MONTHS__", str(BACKTEST_MONTHS))
+            .replace("__SURFACE__", SURFACE).replace("__INK2__", INK_2)
+            .replace("__INK__", INK).replace("__GRID__", GRID))
+    html = html.replace("__DATA__", json.dumps(data, separators=(",", ":")).replace("</", "<\\/"))
+    html = html.replace("__PLOTLY__", plotly_tag)
     HTML_OUT.write_text(html, encoding="utf-8")
 
     # manifest the dashboard reads to list this scanner (only in site/Pages mode)
     if os.environ.get("BACKTEST_OUTPUT_DIR"):
+        hits = cands[cands["Passes_Scanner_Filters"]]
         (OUT_DIR / "scanner.json").write_text(json.dumps({
             "title": SCANNER_TITLE,
             "order": SCANNER_ORDER,
             "page": HTML_OUT.name,
-            "subtitle": f"{start:%b %d, %Y} to {end:%b %d, %Y} · {len(hits):,} hits · "
-                        f"{hits['Ticker'].nunique()} unique tickers",
+            "subtitle": f"{start:%b %d, %Y} to {end:%b %d, %Y} · {len(hits):,} hits with scanner "
+                        f"settings · {hits['Ticker'].nunique()} unique tickers",
         }, indent=2), encoding="utf-8")
+
+
+PAGE_TEMPLATE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>ATH Scanner Backtest</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+__PLOTLY__
+<style>
+  body { background:__SURFACE__; color:__INK__; font-family:Inter,'Segoe UI',Arial,sans-serif;
+         margin:0; padding:24px 16px; }
+  .wrap { max-width:1280px; margin:0 auto; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:__INK2__; font-size:13px; margin-bottom:18px; line-height:1.55; }
+  .tiles { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:18px; }
+  .tile { border:1px solid __GRID__; border-radius:8px; padding:10px 16px; min-width:130px; }
+  .tile .v { font-size:22px; font-weight:600; }
+  .tile .l { font-size:12px; color:__INK2__; }
+  .card { border:1px solid __GRID__; border-radius:10px; padding:8px; margin-bottom:18px; }
+  h2.ct { font-size:16px; font-weight:600; margin:10px 10px 0; }
+  h2 { font-size:15px; margin:6px 8px 10px; }
+  .panel { border:1px solid __GRID__; border-radius:10px; padding:12px 14px; margin-bottom:12px; background:#fff; }
+  .row { display:flex; flex-wrap:wrap; align-items:center; gap:10px 16px; }
+  .row + .row { margin-top:10px; padding-top:10px; border-top:1px solid __GRID__; }
+  .ctl { display:flex; align-items:center; gap:6px; font-size:13px; color:__INK2__; }
+  .ctl input, .ctl select { font:inherit; font-size:14px; padding:6px 8px; border:1px solid #c9c8c2;
+         border-radius:6px; background:#fff; color:__INK__; }
+  .ctl input.n { width:64px; }
+  #tickerInput { width:230px; }
+  button { font:inherit; font-size:13px; padding:7px 12px; border:1px solid #c9c8c2;
+           border-radius:6px; background:#fff; color:__INK__; cursor:pointer; }
+  button:hover { background:#f0efec; }
+  .hint { font-size:12px; color:__INK2__; }
+  #summary { font-size:13px; color:__INK2__; margin:0 0 14px; line-height:1.6; min-height:4px; }
+  #summary b { color:__INK__; }
+  .warn { background:#fff6e0; border:1px solid #f0d58a; border-radius:6px; padding:6px 10px;
+          color:#6b4e00; margin-bottom:6px; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid __GRID__; white-space:nowrap; }
+  th { color:__INK2__; font-weight:500; }
+  .num { text-align:right; }
+  tr.click { cursor:pointer; }
+  tr.click:hover td { background:#f5f4f0; }
+  tr.all td { font-weight:600; background:#f7f6f2; }
+  .tscroll { overflow-x:auto; }
+  .sw { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:6px;
+        vertical-align:-1px; border:1px solid rgba(0,0,0,.08); }
+  .note { color:__INK2__; font-size:12px; margin:8px; line-height:1.5; }
+  a { color:#2a78d6; }
+</style></head><body><div class="wrap">
+<h1>ATH Scanner - __MONTHS__-month backtest</h1>
+<div class="sub">__PERIOD__ · S&amp;P 500 · scanner settings: __DEFAULTS_DESC__<br>
+Each bar segment is one ticker (labeled). Color = __N__-day forward return after the hit:
+red = loss, gray = flat, green = gain, darker green = bigger gain (±__CAP__% or more = darkest).
+Hatched = hit too recent to have a __N__-day result yet. Drag to zoom (or use the slider) to reveal labels.</div>
+
+<div class="panel">
+  <div class="row">
+    <label class="ctl">Sector <select id="sector"><option value="">All sectors</option></select></label>
+    <label class="ctl">Tickers <input id="tickerInput" list="tickerList" autocomplete="off"
+           placeholder="e.g. NVDA  or  NVDA, AVGO, JPM"></label>
+    <datalist id="tickerList"></datalist>
+    <button id="applyBtn">Apply</button>
+    <button id="resetBtn" title="Back to your live scanner's settings">Reset to scanner settings</button>
+  </div>
+  <div class="row">
+    <label class="ctl">RSI <input class="n" id="rsiMin" type="number" step="1" placeholder="min">
+           to <input class="n" id="rsiMax" type="number" step="1" placeholder="max"></label>
+    <label class="ctl">Min RVOL <input class="n" id="rvolMin" type="number" step="0.1" placeholder="any"></label>
+    <label class="ctl">Max days since ATH <select id="maxDays"><option value="">any</option>__DAY_OPTS__</select></label>
+    <label class="ctl">Min today return % <input class="n" id="retMin" type="number" step="0.5" placeholder="any"></label>
+    <label class="ctl">MACD <select id="macd"><option value="any">any</option><option value="bull">bullish</option><option value="bear">bearish</option></select></label>
+    <label class="ctl">Stochastic <select id="stoch"><option value="any">any</option><option value="bull">bullish</option><option value="bear">bearish</option></select></label>
+    <label class="ctl">__N__D forward return <select id="fwdSign">
+      <option value="all">all</option><option value="pos">positive only</option><option value="neg">negative only</option></select></label>
+  </div>
+</div>
+<div id="summary"></div>
+<div class="tiles" id="tiles"></div>
+
+<div class="card"><h2 class="ct">Daily hits - unique tickers passing the filters each trading day</h2><div id="dailyChart"></div></div>
+<div class="card"><h2 class="ct">Weekly hits - sum of daily hits per week (segment = days that ticker hit)</h2><div id="weeklyChart"></div></div>
+
+<div class="card"><h2>Forward returns after a hit (close-to-close), by sector</h2>
+  <div class="tscroll"><table id="sectorTable"></table></div>
+  <div class="note">Click a sector row to filter to it. Hits without enough future data yet are left out
+  of each horizon. Uses today's S&amp;P 500 members, so names that left the index in the past year are
+  missing (survivorship bias) - treat returns as indicative, not a trading result.
+  <br><a href="__CSV__" download>Download every all-time-high candidate (CSV)</a>
+  (column Passes_Scanner_Filters = passes your live scanner's settings)</div></div>
+
+<div class="card"><h2>Most frequent tickers</h2>
+  <div class="tscroll"><table id="topTable"></table></div>
+  <div class="note">Click a ticker to filter to it.</div></div>
+</div>
+
+<script>
+const D = __DATA__;
+const C = D.cols, N = C.d.length, CK = 'f' + D.colorDays;
+const SURF = '__SURFACE__', INK = '__INK__', INK2 = '__INK2__', GRIDC = '__GRID__';
+const DAY = 86400000;
+const $ = id => document.getElementById(id);
+
+// ---------- helpers ----------
+const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+function color(v) {
+  if (v === null || v === undefined || Number.isNaN(v)) return D.pending;
+  const x = Math.max(-1, Math.min(1, v / D.cap)), g = D.gradient;
+  for (let k = 0; k < g.length - 1; k++) {
+    const [p0, c0] = g[k], [p1, c1] = g[k + 1];
+    if (x <= p1) {
+      const f = (x - p0) / (p1 - p0), a = hexRgb(c0), b = hexRgb(c1);
+      return '#' + a.map((v0, j) => Math.round(v0 + (b[j] - v0) * f).toString(16).padStart(2, '0')).join('');
+    }
+  }
+  return g[g.length - 1][1];
+}
+const labelColor = v => (v === null || Math.abs(v) / D.cap < 0.4) ? INK : '#ffffff';
+const pct = (v, d = 2) => v === null || v === undefined ? 'n/a' : (v > 0 ? '+' : '') + v.toFixed(d) + '%';
+const fmt = v => v === null ? 'n/a' : v;
+const ge = (v, x) => v !== null && v >= x;
+const le = (v, x) => v !== null && v <= x;
+const mean = a => a.length ? a.reduce((s, v) => s + v, 0) / a.length : null;
+function median(a) {
+  if (!a.length) return null;
+  const s = [...a].sort((x, y) => x - y), m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+const tick = i => D.tickers[C.t[i]];
+const byFwdDesc = (a, b) => {
+  const va = C[CK][a], vb = C[CK][b];
+  if (va === null && vb === null) return 0;
+  if (va === null) return 1;
+  if (vb === null) return -1;
+  return vb - va;
+};
+function parse(v) {
+  return v.toUpperCase().split(/[\s,;]+/).map(x => x.replace('.', '-')).filter(Boolean);
+}
+function num(id) { const v = $(id).value.trim(); return v === '' ? null : Number(v); }
+function weekMid(ds) {           // Wednesday of the Mon-Fri week containing ds (bar position)
+  const d = new Date(ds + 'T00:00:00Z'), dow = d.getUTCDay();
+  return new Date(d.getTime() + (3 - dow) * DAY).toISOString().slice(0, 10);
+}
+function weekLabel(mid) {
+  const d = new Date(new Date(mid + 'T00:00:00Z').getTime() - 2 * DAY);
+  return d.toLocaleDateString('en-US', {month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC'});
+}
+
+// ---------- filters ----------
+function readFilters() {
+  return {
+    sector: $('sector').value, tickers: new Set(parse($('tickerInput').value)),
+    rsiMin: num('rsiMin'), rsiMax: num('rsiMax'), rvolMin: num('rvolMin'),
+    maxDays: num('maxDays'), retMin: num('retMin'),
+    macd: $('macd').value, stoch: $('stoch').value, fwdSign: $('fwdSign').value,
+  };
+}
+function passes(i, f) {
+  const t = tick(i);
+  if (f.sector && D.sector[t] !== f.sector) return false;
+  if (f.tickers.size && !f.tickers.has(t)) return false;
+  if (f.maxDays !== null && !le(C.dsa[i], f.maxDays)) return false;
+  if (f.rvolMin !== null && !ge(C.rvol[i], f.rvolMin)) return false;
+  if (f.retMin !== null && !ge(C.ret[i], f.retMin)) return false;
+  if (f.rsiMin !== null && !ge(C.rsi[i], f.rsiMin)) return false;
+  if (f.rsiMax !== null && !le(C.rsi[i], f.rsiMax)) return false;
+  if (f.macd !== 'any' && C.macd[i] !== (f.macd === 'bull' ? 1 : 0)) return false;
+  if (f.stoch !== 'any' && C.stoch[i] !== (f.stoch === 'bull' ? 1 : 0)) return false;
+  const fv = C[CK][i];
+  if (f.fwdSign === 'pos' && !(fv !== null && fv > 0)) return false;
+  if (f.fwdSign === 'neg' && !(fv !== null && fv < 0)) return false;
+  return true;
+}
+function setDefaults() {
+  const d = D.defaults, s = (id, v) => { $(id).value = v === null ? '' : v; };
+  s('rsiMin', d.rsiMin); s('rsiMax', d.rsiMax); s('rvolMin', d.rvolMin);
+  s('maxDays', d.maxDays); s('retMin', d.retMin); s('macd', d.macd); s('stoch', d.stoch);
+  $('fwdSign').value = 'all'; $('sector').value = ''; $('tickerInput').value = '';
+}
+
+// ---------- charts ----------
+const scaleTrace = x0 => ({
+  type: 'scatter', x: [x0], y: [0], mode: 'markers', hoverinfo: 'skip', showlegend: false,
+  marker: {size: 0.1, opacity: 0, color: [0], cmin: -D.cap, cmax: D.cap, showscale: true,
+    colorscale: D.gradient.map(([p, c]) => [(p + 1) / 2, c]),
+    colorbar: {orientation: 'h', x: 1, xanchor: 'right', y: 1.03, yanchor: 'bottom', len: 0.34,
+      thickness: 10, outlinewidth: 0, tickfont: {size: 10},
+      tickvals: [-D.cap, -D.cap / 2, 0, D.cap / 2, D.cap],
+      ticktext: [`≤ -${D.cap}%`, `-${D.cap / 2}%`, '0%', `+${D.cap / 2}%`, `≥ +${D.cap}%`],
+      title: {text: `${D.colorDays}D forward return`, side: 'top', font: {size: 11}}}},
+});
+
+function stackTraces(groups, widthMs, hover) {
+  // groups: Map x -> [{t, y, v, cd}] sorted best return first (best at the bottom)
+  let maxK = 0; groups.forEach(a => { maxK = Math.max(maxK, a.length); });
+  const traces = [];
+  for (let k = 0; k < maxK; k++) {
+    const tr = {type: 'bar', x: [], y: [], text: [], customdata: [], showlegend: false,
+      marker: {color: [], line: {color: SURF, width: 0.5},
+               pattern: {shape: [], fgcolor: '#a9a8a2', size: 5, solidity: 0.25}},
+      textposition: 'inside', insidetextanchor: 'middle', constraintext: 'inside',
+      textfont: {size: 10, color: []}, width: widthMs, hovertemplate: hover};
+    groups.forEach((a, x) => {
+      if (a.length <= k) return;
+      const s = a[k];
+      tr.x.push(x); tr.y.push(s.y); tr.text.push(s.t); tr.customdata.push(s.cd);
+      tr.marker.color.push(color(s.v)); tr.marker.pattern.shape.push(s.v === null ? '/' : '');
+      tr.textfont.color.push(labelColor(s.v));
+    });
+    traces.push(tr);
+  }
+  return traces;
+}
+
+function baseLayout(maxY) {
+  return {
+    barmode: 'stack', bargap: 0.18, plot_bgcolor: SURF, paper_bgcolor: SURF, height: 520,
+    margin: {l: 50, r: 20, t: 70, b: 40}, showlegend: false, uirevision: 'keep',
+    font: {family: 'Inter, Segoe UI, Arial, sans-serif', color: INK2, size: 12},
+    hoverlabel: {bgcolor: '#ffffff', font: {color: INK}},
+    xaxis: {showgrid: false, linecolor: GRIDC, rangeslider: {visible: true, thickness: 0.06}},
+    yaxis: {gridcolor: GRIDC, zeroline: false, rangemode: 'tozero', tickformat: ',d',
+            dtick: maxY <= 12 ? 1 : null},
+  };
+}
+
+function drawDaily(idx) {
+  const groups = new Map();
+  [...idx].sort(byFwdDesc).forEach(i => {
+    const x = D.dates[C.d[i]], t = tick(i), v = C[CK][i];
+    if (!groups.has(x)) groups.set(x, []);
+    groups.get(x).push({t, y: 1, v, cd: [t, D.company[t], D.sector[t], C.dsa[i], fmt(C.rvol[i]),
+      fmt(C.rsi[i]), v === null ? 'not yet available' : pct(v), pct(C.ret[i])]});
+  });
+  const hover = '<b>%{customdata[0]}</b> - %{customdata[1]}<br>%{x|%b %d, %Y} · %{customdata[2]}<br>' +
+    'Days since ATH: %{customdata[3]} · RVOL: %{customdata[4]}x · RSI: %{customdata[5]}<br>' +
+    `Day's return: %{customdata[7]}<br><b>${D.colorDays}D forward return: %{customdata[6]}</b><extra></extra>`;
+  const traces = stackTraces(groups, 0.8 * DAY, hover);
+  const tot = D.trading.map(x => (groups.get(x) || []).length);
+  traces.push({type: 'scatter', x: D.trading, y: tot, mode: 'markers', showlegend: false,
+    marker: {opacity: 0, size: 1},
+    hovertemplate: '<b>%{x|%b %d, %Y}</b><br>Hits: %{y}<extra></extra>'});
+  traces.push(scaleTrace(D.trading[0]));
+  const lay = baseLayout(Math.max(0, ...tot));
+  lay.xaxis.rangebreaks = [{bounds: ['sat', 'mon']}, {values: D.holidays}];
+  Plotly.react('dailyChart', traces, lay, {displaylogo: false, responsive: true});
+}
+
+function drawWeekly(idx) {
+  const wk = new Map();   // mid -> Map ticker -> {days, vals, dates}
+  idx.forEach(i => {
+    const ds = D.dates[C.d[i]], mid = weekMid(ds), t = tick(i);
+    if (!wk.has(mid)) wk.set(mid, new Map());
+    const m = wk.get(mid);
+    if (!m.has(t)) m.set(t, {days: 0, vals: [], dates: []});
+    const e = m.get(t); e.days++; e.dates.push(ds);
+    if (C[CK][i] !== null) e.vals.push(C[CK][i]);
+  });
+  const groups = new Map(), totals = {}, uniq = {};
+  [...wk.keys()].sort().forEach(mid => {
+    const segs = [];
+    wk.get(mid).forEach((e, t) => {
+      const v = e.vals.length ? mean(e.vals) : null;
+      const dl = e.dates.sort().map(d => new Date(d + 'T00:00:00Z')
+        .toLocaleDateString('en-US', {weekday: 'short', month: '2-digit', day: '2-digit', timeZone: 'UTC'})).join(', ');
+      segs.push({t, y: e.days, v, cd: [t, D.company[t], D.sector[t], dl, weekLabel(mid),
+        v === null ? 'not yet available' : pct(v)]});
+    });
+    segs.sort((a, b) => (a.v === null) - (b.v === null) || (b.v || 0) - (a.v || 0));
+    groups.set(mid, segs);
+    totals[mid] = segs.reduce((s, x) => s + x.y, 0); uniq[mid] = segs.length;
+  });
+  const hover = '<b>%{customdata[0]}</b> - %{customdata[1]}<br>Week of %{customdata[4]} · %{customdata[2]}<br>' +
+    'Days hit this week: %{y}<br>%{customdata[3]}<br>' +
+    `<b>Avg ${D.colorDays}D forward return: %{customdata[5]}</b><extra></extra>`;
+  const traces = stackTraces(groups, 0.8 * 5 * DAY, hover);
+  const allWeeks = [...new Set(D.trading.map(weekMid))].sort();
+  traces.push({type: 'scatter', x: allWeeks, y: allWeeks.map(w => totals[w] || 0), mode: 'markers',
+    showlegend: false, marker: {opacity: 0, size: 1}, customdata: allWeeks.map(w => [uniq[w] || 0, weekLabel(w)]),
+    hovertemplate: 'Week of %{customdata[1]}<br>Total hits: %{y}<br>Unique tickers: %{customdata[0]}<extra></extra>'});
+  traces.push(scaleTrace(allWeeks[0]));
+  const lay = baseLayout(Math.max(0, ...Object.values(totals)));
+  lay.xaxis.tickformat = '%b %d';
+  lay.annotations = Object.entries(totals).map(([x, v]) => ({x, y: v, text: String(v), showarrow: false,
+    yshift: 9, font: {size: 10, color: INK2}}));
+  Plotly.react('weeklyChart', traces, lay, {displaylogo: false, responsive: true});
+}
+
+// ---------- tiles + tables ----------
+function tiles(idx) {
+  const perDay = {}; idx.forEach(i => { perDay[C.d[i]] = (perDay[C.d[i]] || 0) + 1; });
+  const counts = Object.values(perDay), fv = idx.map(i => C[CK][i]).filter(v => v !== null);
+  const win = fv.length ? fv.filter(v => v > 0).length / fv.length * 100 : null;
+  const t = [
+    [idx.length.toLocaleString(), 'total hits'],
+    [new Set(idx.map(i => C.t[i])).size, 'unique tickers'],
+    [(idx.length / Math.max(D.trading.length, 1)).toFixed(1), 'avg hits / trading day'],
+    [`${counts.length}/${D.trading.length}`, 'days with ≥1 hit'],
+    [counts.length ? Math.max(...counts) : 0, 'busiest day'],
+    [win === null ? 'n/a' : win.toFixed(0) + '%', `${D.colorDays}D win rate`],
+    [pct(mean(fv)), `avg ${D.colorDays}D forward return`],
+  ];
+  $('tiles').innerHTML = t.map(([v, l]) => `<div class="tile"><div class="v">${v}</div><div class="l">${l}</div></div>`).join('');
+}
+
+function statRow(label, rows, cls, attr) {
+  const fw = n => rows.map(i => C['f' + n][i]).filter(v => v !== null);
+  const fc = fw(D.colorDays), avgC = mean(fc);
+  const cells = D.fwdDays.map(n => {
+    const m = mean(fw(n));
+    const sw = n === D.colorDays ? `<span class="sw" style="background:${color(m)}"></span>` : '';
+    return `<td class="num">${sw}${pct(m)}</td>`;
+  }).join('');
+  const win = fc.length ? (fc.filter(v => v > 0).length / fc.length * 100).toFixed(0) + '%' : 'n/a';
+  return {avg: avgC, html: `<tr class="${cls}" ${attr}><td>${label}</td><td class="num">${rows.length}</td>` +
+    `<td class="num">${new Set(rows.map(i => C.t[i])).size}</td>${cells}` +
+    `<td class="num">${pct(median(fc))}</td><td class="num">${win}</td></tr>`};
+}
+
+function sectorTable(idx) {
+  const by = new Map();
+  idx.forEach(i => { const s = D.sector[tick(i)]; if (!by.has(s)) by.set(s, []); by.get(s).push(i); });
+  const head = `<tr><th>Sector</th><th class="num">Hits</th><th class="num">Tickers</th>` +
+    D.fwdDays.map(n => `<th class="num">Avg ${n}D</th>`).join('') +
+    `<th class="num">Median ${D.colorDays}D</th><th class="num">${D.colorDays}D % positive</th></tr>`;
+  const rows = [...by.entries()].map(([s, r]) => statRow(
+      `<b>${s}</b> <span class="hint">${D.sectorName[s] || ''}</span>`, r, 'click', `data-sector="${s}"`))
+    .sort((a, b) => (a.avg === null) - (b.avg === null) || (b.avg || 0) - (a.avg || 0));
+  const all = statRow('All sectors', idx, 'all click', 'data-sector=""');
+  $('sectorTable').innerHTML = head + (idx.length ? all.html + rows.map(r => r.html).join('')
+    : '<tr><td colspan="9" class="hint">No hits match these filters.</td></tr>');
+  $('sectorTable').querySelectorAll('tr.click').forEach(tr => tr.onclick = () => {
+    $('sector').value = tr.dataset.sector; fillTickerList(); render();
+  });
+}
+
+function topTable(idx) {
+  const by = new Map();
+  idx.forEach(i => { const t = tick(i); if (!by.has(t)) by.set(t, []); by.get(t).push(i); });
+  const top = [...by.entries()].sort((a, b) => b[1].length - a[1].length).slice(0, 15);
+  $('topTable').innerHTML = `<tr><th>Ticker</th><th>Company</th><th>Sector</th><th class="num">Days hit</th>` +
+    `<th class="num">Avg ${D.colorDays}D fwd</th></tr>` + top.map(([t, r]) => {
+      const m = mean(r.map(i => C[CK][i]).filter(v => v !== null));
+      return `<tr class="click" data-t="${t}"><td><b>${t}</b></td><td>${D.company[t]}</td><td>${D.sector[t]}</td>` +
+        `<td class="num">${r.length}</td><td class="num"><span class="sw" style="background:${color(m)}"></span>${pct(m)}</td></tr>`;
+    }).join('');
+  $('topTable').querySelectorAll('tr.click').forEach(tr => tr.onclick = () => {
+    $('tickerInput').value = tr.dataset.t; render(); window.scrollTo({top: 0, behavior: 'smooth'});
+  });
+}
+
+function summary(idx, f) {
+  const lines = [];
+  if (f.fwdSign !== 'all')
+    lines.push(`<div class="warn">Showing only hits whose ${D.colorDays}-day forward return was ` +
+      `<b>${f.fwdSign === 'pos' ? 'positive' : 'negative'}</b>. This is a hindsight view for studying ` +
+      `winners or losers - the stats below are no longer a fair backtest of the scanner.</div>`);
+  f.tickers.forEach(t => {
+    if (!D.company[t]) { lines.push(`<b>${t}</b>: never made a new all-time high in this window (or not an S&amp;P 500 ticker).`); return; }
+    if (f.sector && D.sector[t] !== f.sector) { lines.push(`<b>${t}</b> is in ${D.sector[t]}, not ${f.sector} - clear the sector to see it.`); return; }
+    const r = idx.filter(i => tick(i) === t);
+    if (!r.length) { lines.push(`<b>${t}</b> - ${D.company[t]} (${D.sector[t]}): no hits with the current filters.`); return; }
+    const ds = r.map(i => D.dates[C.d[i]]).sort();
+    const f2 = D.fwdDays.map(n => `${n}D ${pct(mean(r.map(i => C['f' + n][i]).filter(v => v !== null)))}`).join(' · ');
+    lines.push(`<b>${t}</b> - ${D.company[t]} (${D.sector[t]}) · <b>${r.length}</b> days hit · first ${ds[0]} · ` +
+      `last ${ds[ds.length - 1]} · avg forward return: ${f2}`);
+  });
+  $('summary').innerHTML = lines.join('<br>');
+}
+
+function render() {
+  const f = readFilters(), idx = [];
+  for (let i = 0; i < N; i++) if (passes(i, f)) idx.push(i);
+  drawDaily(idx); drawWeekly(idx); tiles(idx); sectorTable(idx); topTable(idx); summary(idx, f);
+}
+
+function fillTickerList() {
+  const sec = $('sector').value;
+  $('tickerList').innerHTML = D.tickers.filter(t => !sec || D.sector[t] === sec)
+    .map(t => `<option value="${t}">${D.company[t]}</option>`).join('');
+}
+
+// when embedded in the dashboard (iframe), tell the parent page how tall this report is
+function postHeight() {
+  if (window.parent !== window)
+    window.parent.postMessage({type: 'scanner-height', h: document.documentElement.scrollHeight}, '*');
+}
+
+(function init() {
+  $('sector').innerHTML += Object.keys(D.sectorName).sort((a, b) => D.sectorName[a].localeCompare(D.sectorName[b]))
+    .map(s => `<option value="${s}">${D.sectorName[s]} (${s})</option>`).join('');
+  setDefaults(); fillTickerList(); render();
+  ['rsiMin', 'rsiMax', 'rvolMin', 'retMin'].forEach(id => $(id).addEventListener('change', render));
+  ['maxDays', 'macd', 'stoch', 'fwdSign'].forEach(id => $(id).addEventListener('change', render));
+  $('sector').addEventListener('change', () => { fillTickerList(); render(); });
+  $('applyBtn').onclick = render;
+  $('resetBtn').onclick = () => { setDefaults(); fillTickerList(); render(); };
+  $('tickerInput').addEventListener('keydown', e => { if (e.key === 'Enter') render(); });
+  $('tickerInput').addEventListener('change', render);
+  window.addEventListener('load', postHeight);
+  if (window.ResizeObserver) new ResizeObserver(postHeight).observe(document.body);
+})();
+</script>
+</body></html>
+"""
 
 
 # ============================================================
@@ -674,14 +795,15 @@ def main():
     start = end - pd.DateOffset(months=BACKTEST_MONTHS)
     print(f"Replaying scanner from {start:%Y-%m-%d} to {end:%Y-%m-%d}...")
 
-    hits, trading_days = run_backtest(data, sp500, start)
-    if hits.empty:
-        print("No hits in the backtest window.")
+    cands, trading_days = run_backtest(data, sp500, start)
+    if cands.empty:
+        print("No all-time-high candidates in the backtest window.")
         return
 
-    hits.to_csv(CSV_OUT, index=False)
-    build_report(hits, trading_days, start, end)
-    print(f"{len(hits):,} hits across {hits['Ticker'].nunique()} tickers.")
+    cands.to_csv(CSV_OUT, index=False)
+    build_report(cands, trading_days, start, end)
+    n_pass = int(cands["Passes_Scanner_Filters"].sum())
+    print(f"{len(cands):,} all-time-high candidates; {n_pass:,} pass the scanner settings.")
     print(f"Report: {HTML_OUT}\nCSV:    {CSV_OUT}")
 
 

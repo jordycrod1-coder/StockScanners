@@ -41,6 +41,19 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
+
+      # --- Scanner sections (appear at the bottom of the dashboard) ---
+      # Each one writes into site/scanners/<name>/. Add future scanners as
+      # extra steps here, BEFORE "Generate S&P 500 dashboard".
+      # continue-on-error: a failed scanner never blocks the dashboard publish.
+      - name: Scanner section - All-Time-High backtest
+        continue-on-error: true
+        env:
+          BACKTEST_OUTPUT_DIR: site/scanners/ath-backtest
+          BACKTEST_HTML_NAME: index.html
+          BACKTEST_PLOTLY_JS: cdn
+        run: python ath_scanner_backtest.py
+
       - name: Generate S&P 500 dashboard
         run: python dashboard_sp500.py
       - name: Upload Pages artifact

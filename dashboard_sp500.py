@@ -2760,6 +2760,41 @@ _cards_html = "\n".join(
     for _filename, _title in GENERATED_IMAGES
 )
 
+# ============================================================
+# SCANNER SECTIONS (appended below the dashboard charts)
+# ============================================================
+# Each scanner writes its own interactive report into
+# OUTPUT_DIR/scanners/<name>/ together with a small scanner.json
+# ({"title", "subtitle", "order", "page"}). Every folder found here is
+# added at the bottom of the page, so new scanners need no edits to
+# this file - just run them before this script in the workflow.
+import glob as _glob
+import json as _json
+
+_scanner_sections = []
+for _manifest in _glob.glob(os.path.join(OUTPUT_DIR, "scanners", "*", "scanner.json")):
+    try:
+        with open(_manifest) as _mf:
+            _m = _json.load(_mf)
+        _rel = os.path.relpath(os.path.dirname(_manifest), OUTPUT_DIR).replace(os.sep, "/")
+        _scanner_sections.append((_m.get("order", 100), _m.get("title", _rel),
+                                  _m.get("subtitle", ""), f"{_rel}/{_m.get('page', 'index.html')}"))
+    except Exception as _e:
+        print(f"  Skipping scanner manifest {_manifest}: {_e}")
+_scanner_sections.sort(key=lambda x: (x[0], x[1]))
+
+_scanners_html = ""
+if _scanner_sections:
+    _scanners_html = '  <h1 class="section-title">Scanners</h1>\n' + "\n".join(
+        f"""    <section class="card scanner">
+      <h2>{_title} <a class="open-link" href="{_src}" target="_blank" rel="noopener">Open full page &#8599;</a></h2>
+      <div class="scanner-sub">{_sub}</div>
+      <iframe class="scanner-frame" src="{_src}" title="{_title}" loading="lazy"></iframe>
+    </section>"""
+        for _order, _title, _sub, _src in _scanner_sections
+    )
+print(f"Found {len(_scanner_sections)} scanner section(s)")
+
 _page_html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2786,6 +2821,10 @@ _page_html = f"""<!DOCTYPE html>
   }}
   .card h2 {{ font-size: 16px; margin: 0 0 12px; }}
   img {{ max-width: 100%; height: auto; display: block; }}
+  .section-title {{ margin: 40px 0 16px; padding-top: 16px; border-top: 2px solid #e2e2e2; }}
+  .card h2 .open-link {{ font-size: 13px; font-weight: normal; margin-left: 10px; color: #2a78d6; }}
+  .scanner-sub {{ color: #666; font-size: 13px; margin: -6px 0 10px; }}
+  .scanner-frame {{ width: 100%; height: 1900px; border: 0; display: block; }}
 </style>
 </head>
 <body>
@@ -2795,6 +2834,17 @@ _page_html = f"""<!DOCTYPE html>
     regenerated automatically after each scheduled GitHub Actions run.
   </div>
 {_cards_html}
+{_scanners_html}
+<script>
+  // scanner reports report their own height so each section fits without inner scrollbars
+  window.addEventListener("message", function (e) {{
+    var d = e.data;
+    if (!d || d.type !== "scanner-height") return;
+    document.querySelectorAll("iframe.scanner-frame").forEach(function (f) {{
+      if (f.contentWindow === e.source) f.style.height = (d.h + 8) + "px";
+    }});
+  }});
+</script>
 </body>
 </html>
 """

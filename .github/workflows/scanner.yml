@@ -33,6 +33,24 @@ jobs:
           ALERT_TO: jordycrod1@gmail.com
         run: python scanner_All-Time-High_1.py
 
+  # Buy/sell email alerts from the multi-timeframe indicator scanner (TSLA).
+  # Emails only when the buy and/or sell rule fires on today's close.
+  Scanner_MTF-Buy-Sell-Signals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Run multi-timeframe buy/sell signal scanner
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          ALERT_TO: jordycrod1@gmail.com
+          SIGNAL_TICKER: TSLA
+        run: python mtf_signal_scanner.py --alert
+
   Dashboard:
     runs-on: ubuntu-latest
     steps:
@@ -53,6 +71,15 @@ jobs:
           BACKTEST_HTML_NAME: index.html
           BACKTEST_PLOTLY_JS: cdn
         run: python ath_scanner_backtest.py
+
+      - name: Scanner section - Multi-timeframe buy/sell signals backtest (TSLA)
+        continue-on-error: true
+        env:
+          BACKTEST_OUTPUT_DIR: site/scanners/mtf-signals-backtest
+          BACKTEST_HTML_NAME: index.html
+          BACKTEST_PLOTLY_JS: cdn
+          SIGNAL_TICKER: TSLA
+        run: python mtf_signal_scanner.py
 
       - name: Generate S&P 500 dashboard
         run: python dashboard_sp500.py

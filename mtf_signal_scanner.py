@@ -27,20 +27,36 @@ Two ways to find good values:
      recent part it never saw (test period). Trust the test numbers, not the
      training numbers.
 
+Two buy rules and two sell rules
+--------------------------------
+There are four rule slots: Buy 1, Buy 2, Sell 1, Sell 2, so you can run two
+different strategies side by side. The report also pairs them up as round trips
+(buy on a Buy signal, sell on the next Sell signal) and shows how long those
+trades were held, bucketed into the forward-return horizons (5, 10, 20, 42, 63
+trading days = 1 week, 2 weeks, ~1 month, ~2 months, ~3 months).
+
+Saving rules
+------------
+The report autosaves your inputs in the browser and has a small library of named
+rules. "Export rules" downloads mtf_signal_rules_<TICKER>.json. Put that file next
+to this script and the scanner uses those rules for the report's starting filters
+and for email alerts (it wins over the BUY_RULE / SELL_RULE settings below).
+
 Alerts
 ------
-  python mtf_signal_scanner.py            -> builds the report + CSV (no email)
-  python mtf_signal_scanner.py --alert    -> checks today's bar and emails a BUY
-                                             and/or SELL alert when a rule fires
+  python mtf_signal_scanner.py                 -> builds the report + CSV (no email)
+  python mtf_signal_scanner.py --ticker NVDA   -> same for another ticker
+  python mtf_signal_scanner.py --alert         -> checks today's bar and emails an
+                                                  alert when any rule fires
 Email uses EMAIL_USER / EMAIL_PASS / ALERT_TO (same secrets as the ATH scanner).
-BUY_RULE / SELL_RULE below decide what triggers an alert ("auto" = the suggested
-rule). Once you have picked rules in the report, paste them in as dicts so they
-stop changing from day to day.
+
+Suggested rules are recomputed on every run from the latest OPTIMIZER_YEARS (5)
+years of data, so they adapt to whichever ticker you run.
 
 Outputs (written next to this script unless BACKTEST_OUTPUT_DIR is set):
   mtf_signal_report.html - open in any browser
   mtf_signal_days.csv    - every day with all indicators, forward returns, and
-                           Buy_Signal / Sell_Signal flags for the scanner's rules
+                           Buy_Signal / Buy2_Signal / Sell_Signal / Sell2_Signal flags
 
 Requires: pip install yfinance pandas numpy plotly
 Not financial advice: past indicator behavior does not guarantee future returns.
@@ -91,6 +107,14 @@ DATA_PERIOD = "max"
 #              MACD_Bull, MACD_Pos, Hist_Rising, Stoch_Bull, Flow_Bull, Candle_Up
 BUY_RULE = "auto"
 SELL_RULE = "auto"
+# Second strategy. "auto" = the optimizer's alternative rule, built from different
+# indicators than rule 1. None = slot left empty (never fires, no alerts).
+BUY_RULE_2 = "auto"
+SELL_RULE_2 = "auto"
+
+# Rules saved from the report ("Export rules"). When this file exists it overrides
+# the four settings above. {ticker} is replaced with the ticker symbol.
+RULES_FILE = os.environ.get("SIGNAL_RULES_FILE", "mtf_signal_rules_{ticker}.json")
 
 # "every" = email every day the rule is true; "new" = only the first day of a streak
 ALERT_MODE = "every"
@@ -99,10 +123,15 @@ ALERT_MODE = "every"
 # BACKTEST / OPTIMIZER SETTINGS
 # ============================================================
 
-BACKTEST_YEARS = 10          # days replayed (None = all history after indicator warm-up)
-FORWARD_DAYS = [5, 10, 20]   # forward returns in the CSV + report
-TARGET_FWD_DAYS = 10         # horizon the optimizer maximizes (buy) / minimizes (sell)
-TRAIN_FRACTION = 0.70        # oldest 70% of days to pick rules, newest 30% to test them
+BACKTEST_YEARS = 10          # days in the report (None = all history after indicator warm-up)
+DEFAULT_VIEW_YEARS = 5       # date range the report opens on (you can change it in the page)
+OPTIMIZER_YEARS = 5          # suggested rules are searched on the latest N years only
+# Forward returns in the CSV + report, in trading days (~21 per month):
+#   5 = 1 week, 10 = 2 weeks, 20 = ~1 month, 42 = ~2 months, 63 = ~3 months
+FORWARD_DAYS = [5, 10, 20, 42, 63]
+HORIZON_NAMES = {5: "1 week", 10: "2 weeks", 20: "~1 month", 42: "~2 months", 63: "~3 months"}
+TARGET_FWD_DAYS = 10         # horizon used by "auto" rules for alerts (report shows every horizon)
+TRAIN_FRACTION = 0.70        # oldest 70% of the optimizer window to pick rules, newest 30% to test
 MIN_SIGNAL_DAYS = 40         # a rule must fire on at least this many training days...
 MIN_EPISODES = 10            # ...spread over at least this many separate streaks
 MAX_RULE_CONDITIONS = 3      # conditions in a suggested rule
@@ -122,8 +151,16 @@ else:
 HTML_OUT = OUT_DIR / os.environ.get("BACKTEST_HTML_NAME", "mtf_signal_report.html")
 CSV_OUT = OUT_DIR / "mtf_signal_days.csv"
 
-SCANNER_TITLE = f"{TICKER} Multi-Timeframe Buy/Sell Signals - Backtest"
 SCANNER_ORDER = 20           # after the ATH backtest (10)
+
+# Rule slots: id, label, direction (+1 buy = want high forward returns, -1 sell = low),
+# settings variable, CSV column
+SLOTS = [("buy1", "Buy 1", +1, "BUY_RULE", "Buy_Signal"),
+         ("buy2", "Buy 2", +1, "BUY_RULE_2", "Buy2_Signal"),
+         ("sell1", "Sell 1", -1, "SELL_RULE", "Sell_Signal"),
+         ("sell2", "Sell 2", -1, "SELL_RULE_2", "Sell2_Signal")]
+SLOT_LABEL = {s: lab for s, lab, *_ in SLOTS}
+SLOT_COL = {s: col for s, *_, col in SLOTS}
 
 PLOTLY_JS = os.environ.get("BACKTEST_PLOTLY_JS", "inline")   # "inline" or "cdn"
 
@@ -376,6 +413,8 @@ def parse_rule(spec, name):
         if k not in ALL_KEYS:
             raise ValueError(f"{name}: unknown field '{k}'. Valid: {', '.join(ALL_KEYS)}")
         if k in BOOL_KEYS:
+            if v is None:
+                continue
             if not isinstance(v, bool):
                 raise ValueError(f"{name}: '{k}' is a yes/no field - use True or False")
             conds.append({"k": k, "op": "==", "v": 1 if v else 0})
@@ -451,14 +490,18 @@ def candidates(train):
     return out
 
 
-def optimize(train, test, direction):
+def optimize(train, test, direction, horizon, exclude=(), cands=None, with_singles=True):
     """direction +1 = buy (maximize forward return), -1 = sell (minimize it).
 
     Rules are picked on the training days only; the test days are only scored.
+    The last `horizon` training days are dropped from scoring because their forward
+    window reaches into the test period. `exclude` = fields the rule may not use
+    (used to build a second, different strategy).
     """
-    tgt = f"Fwd_{TARGET_FWD_DAYS}D%"
-    y_tr, y_te = train[tgt].values, test[tgt].values
-    cands = candidates(train)
+    tgt = f"Fwd_{horizon}D%"
+    y_tr, y_te = train[tgt].values.copy(), test[tgt].values
+    y_tr[max(0, len(y_tr) - horizon):] = np.nan
+    cands = [c for c in (cands or candidates(train)) if c["k"] not in exclude]
     masks = [cond_mask(train, c) for c in cands]
     has_y = ~np.isnan(y_tr)
 
@@ -472,15 +515,17 @@ def optimize(train, test, direction):
         return direction * float(y_tr[mm].mean())
 
     # best single condition per field
-    singles = {}
-    for c, m in zip(cands, masks):
-        s = score(m)
-        if s is not None and (c["k"] not in singles or s > singles[c["k"]][0]):
-            singles[c["k"]] = (s, c)
-    top = sorted(singles.values(), key=lambda x: -x[0])[:TOP_SINGLE_CONDITIONS]
-    single_rows = [{"cond": c, "text": cond_text(c),
-                    "train": stats(cond_mask(train, c), y_tr), "test": stats(cond_mask(test, c), y_te)}
-                   for _, c in top]
+    single_rows = []
+    if with_singles:
+        singles = {}
+        for c, m in zip(cands, masks):
+            s = score(m)
+            if s is not None and (c["k"] not in singles or s > singles[c["k"]][0]):
+                singles[c["k"]] = (s, c)
+        top = sorted(singles.values(), key=lambda x: -x[0])[:TOP_SINGLE_CONDITIONS]
+        single_rows = [{"cond": c, "text": cond_text(c),
+                        "train": stats(cond_mask(train, c), y_tr), "test": stats(cond_mask(test, c), y_te)}
+                       for _, c in top]
 
     # greedy combined rule
     rule, cur, cur_score = [], np.ones(len(train), dtype=bool), None
@@ -545,22 +590,65 @@ def prepare():
         start = max(start, end - pd.DateOffset(years=BACKTEST_YEARS))
     win = hist[(hist.index >= start) & valid].copy()
 
-    tgt = f"Fwd_{TARGET_FWD_DAYS}D%"
-    scored = win.index[win[tgt].notna()]
-    split_date = scored[int(len(scored) * TRAIN_FRACTION)]
-    train, test = win[win.index < split_date], win[win.index >= split_date]
+    # Optimizer: latest OPTIMIZER_YEARS only, oldest TRAIN_FRACTION to pick, rest to test
+    opt_start = win.index.min()
+    if OPTIMIZER_YEARS:
+        opt_start = max(opt_start, end - pd.DateOffset(years=OPTIMIZER_YEARS))
+    opt = win[win.index >= opt_start]
+    split_date = opt.index[int(len(opt) * TRAIN_FRACTION)]
+    train, test = opt[opt.index < split_date], opt[opt.index >= split_date]
 
-    suggest = {"buy": optimize(train, test, +1), "sell": optimize(train, test, -1)}
+    # Suggestions for every horizon: rule 1 = best, rule 2 = best using other indicators
+    cands = candidates(train)
+    suggest = {}
+    for h in FORWARD_DAYS:
+        suggest[h] = {}
+        for side, direction in (("buy", +1), ("sell", -1)):
+            first = optimize(train, test, direction, h, cands=cands)
+            second = optimize(train, test, direction, h, exclude={c["k"] for c in first["rule"]},
+                              cands=cands, with_singles=False)
+            suggest[h][f"{side}1"], suggest[h][f"{side}2"] = first, second
+
+    saved, saved_path = load_rules_file()
     rules = {}
-    for side, spec in (("buy", BUY_RULE), ("sell", SELL_RULE)):
-        if isinstance(spec, str) and spec.lower() == "auto":
-            rules[side] = {"conds": suggest[side]["rule"], "source": "auto"}
+    for slot, lab, _, var, col in SLOTS:
+        if saved is not None and slot in saved:
+            spec, source = saved[slot], "saved"
         else:
-            rules[side] = {"conds": parse_rule(spec, f"{side.upper()}_RULE"), "source": "settings"}
-        rules[side]["text"] = rule_text(rules[side]["conds"])
-        win[f"{side.title()}_Signal"] = rule_mask(win, rules[side]["conds"])
-    win["Period"] = np.where(win.index < split_date, "train", "test")
-    return win, train, test, split_date, suggest, rules
+            spec, source = globals()[var], "settings"
+        if spec is None:
+            conds = []
+        elif isinstance(spec, str) and spec.lower() == "auto":
+            conds, source = suggest[TARGET_FWD_DAYS][slot]["rule"], "auto"
+        else:
+            conds = parse_rule(spec, f"{lab} rule ({saved_path.name if source == 'saved' else var})")
+        rules[slot] = {"conds": conds, "source": source, "text": rule_text(conds)}
+        win[col] = rule_mask(win, conds)
+    win["Period"] = np.select([win.index < opt_start, win.index < split_date], ["before_optimizer", "train"], "test")
+    return win, opt_start, split_date, suggest, rules
+
+
+def rules_path():
+    p = Path(RULES_FILE.replace("{ticker}", TICKER))
+    if not p.is_absolute():
+        try:
+            p = Path(__file__).resolve().parent / p
+        except NameError:
+            p = Path.cwd() / p
+    return p
+
+
+def load_rules_file():
+    """Rules exported from the report (dict of slot -> {field: [min, max] | true/false})."""
+    p = rules_path()
+    if not p.exists():
+        return None, p
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if data.get("ticker") and data["ticker"].upper() != TICKER.upper():
+        print(f"Note: {p.name} was saved from the {data['ticker']} report; using it for {TICKER} anyway.")
+    rules = {k: v for k, v in (data.get("rules") or {}).items() if k in SLOT_LABEL}
+    print(f"Using saved rules from {p.name}: {', '.join(SLOT_LABEL[k] for k in rules) or 'none'}")
+    return rules, p
 
 
 # ============================================================
@@ -570,11 +658,11 @@ def prepare():
 def latest_status(win, rules):
     last = win.iloc[-1]
     out = {}
-    for side in ("buy", "sell"):
-        conds = rules[side]["conds"]
-        mask = win[f"{side.title()}_Signal"].values
+    for slot, *_ in SLOTS:
+        conds = rules[slot]["conds"]
+        mask = win[SLOT_COL[slot]].values
         checks = [(c, float(last[c["k"]]), bool(cond_mask(win.iloc[[-1]], c)[0])) for c in conds]
-        out[side] = {"fires": bool(mask[-1]), "streak": streak(mask), "checks": checks}
+        out[slot] = {"fires": bool(mask[-1]), "streak": streak(mask), "checks": checks}
     return out
 
 
@@ -602,6 +690,9 @@ def send_email(subject, body):
     return True
 
 
+SOURCE_TEXT = {"auto": "suggested by the optimizer", "settings": "from your settings", "saved": "saved from the report"}
+
+
 def run_alerts(win, suggest, rules, split_date, force=False):
     day = win.index[-1]
     today_et = datetime.now(ZoneInfo(MARKET_TZ)).date()
@@ -611,28 +702,28 @@ def run_alerts(win, suggest, rules, split_date, force=False):
     status = latest_status(win, rules)
     last = win.iloc[-1]
     fired = []
-    for side in ("buy", "sell"):
-        st = status[side]
-        if not rules[side]["conds"]:
-            print(f"{side.upper()}: no rule conditions - skipped.")
+    for slot, lab, *_ in SLOTS:
+        st = status[slot]
+        if not rules[slot]["conds"]:
+            print(f"{lab.upper()}: no rule conditions - skipped.")
             continue
-        print(f"{side.upper()} rule ({rules[side]['source']}): {rules[side]['text']} -> "
+        print(f"{lab.upper()} rule ({rules[slot]['source']}): {rules[slot]['text']} -> "
               f"{'FIRES' if st['fires'] else 'no signal'}"
               + (f" (day {st['streak']} in a row)" if st["fires"] else ""))
         if st["fires"] and (ALERT_MODE == "every" or st["streak"] == 1):
-            fired.append(side)
+            fired.append(slot)
     if not fired:
         print("No alerts today.")
         return
 
     lines = [f"{TICKER} close {day:%a %b %d, %Y}: ${last['Close']:,.2f}", ""]
-    for side in fired:
-        st, r = status[side], rules[side]
-        te = suggest[side]["test"] if r["source"] == "auto" else stats(
-            win[f"{side.title()}_Signal"].values[win.index >= split_date],
+    for slot in fired:
+        st, r = status[slot], rules[slot]
+        te = suggest[TARGET_FWD_DAYS][slot]["test"] if r["source"] == "auto" else stats(
+            win[SLOT_COL[slot]].values[win.index >= split_date],
             win[f"Fwd_{TARGET_FWD_DAYS}D%"].values[win.index >= split_date])
-        lines += [f"=== {side.upper()} ALERT (day {st['streak']} in a row) ===",
-                  f"Rule ({'suggested by the optimizer' if r['source'] == 'auto' else 'from your settings'}):"]
+        lines += [f"=== {SLOT_LABEL[slot].upper()} ALERT (day {st['streak']} in a row) ===",
+                  f"Rule ({SOURCE_TEXT[r['source']]}):"]
         lines += [f"  - {cond_text(c)}   (today: {fmt_val(c['k'], v)})" for c, v, _ in st["checks"]]
         if te["avg"] is not None:
             lines.append(f"Backtest, test period since {split_date:%b %Y}: fired on {te['n']} days, "
@@ -650,7 +741,7 @@ def run_alerts(win, suggest, rules, split_date, force=False):
         lines += ["", f"Dashboard: {os.environ['DASHBOARD_URL']}"]
     lines += ["", "Automated scanner alert based on historical indicator behavior. Not financial advice."]
     body = "\n".join(lines)
-    subject = f"{TICKER} {' + '.join(s.upper() for s in fired)} alert - {day:%b %d, %Y} close ${last['Close']:,.2f}"
+    subject = f"{TICKER} {' + '.join(SLOT_LABEL[s].upper() for s in fired)} alert - {day:%b %d, %Y} close ${last['Close']:,.2f}"
     print("\n" + subject + "\n" + body)
     send_email(subject, body)
 
@@ -663,16 +754,14 @@ def _col(series, nd):
     return [None if pd.isna(v) else round(float(v), nd) for v in series]
 
 
-def build_report(win, split_date, suggest, rules):
-    tgt = f"Fwd_{TARGET_FWD_DAYS}D%"
+
+
+def build_report(win, opt_start, split_date, suggest, rules):
     meta = []
     for tf, tfname, _ in TIMEFRAMES:
         for name, lab, step, nd in NUM_FIELDS:
-            k = f"{tf}_{name}"
-            edges = np.nanquantile(win[k].values, np.linspace(0, 1, 11))
-            edges = sorted({round(float(e), nd) for e in edges})
-            meta.append({"k": k, "tf": tf, "tfName": tfname, "name": name, "label": lab,
-                         "kind": "num", "step": step, "edges": edges})
+            meta.append({"k": f"{tf}_{name}", "tf": tf, "tfName": tfname, "name": name, "label": lab,
+                         "kind": "num", "step": step, "nd": nd})
         for name, lab in BOOL_FIELDS:
             meta.append({"k": f"{tf}_{name}", "tf": tf, "tfName": tfname, "name": name, "label": lab,
                          "kind": "bool"})
@@ -682,8 +771,10 @@ def build_report(win, split_date, suggest, rules):
         feats[k] = ([None if pd.isna(v) else int(v) for v in win[k]] if k in BOOL_KEYS
                     else _col(win[k], DECIMALS[k.split("_", 1)[1]]))
 
-    def js_stats_rows(rows):
-        return [{"cond": r["cond"], "text": r["text"], "train": r["train"], "test": r["test"]} for r in rows]
+    def sug(g):
+        return {"rule": g["rule"], "text": g["text"], "train": g["train"], "test": g["test"],
+                "singles": [{"cond": r["cond"], "text": r["text"], "train": r["train"], "test": r["test"]}
+                            for r in g["singles"]]}
 
     data = {
         "ticker": TICKER,
@@ -692,18 +783,23 @@ def build_report(win, split_date, suggest, rules):
         "feats": feats,
         "fwd": {str(n): _col(win[f"Fwd_{n}D%"], 2) for n in FORWARD_DAYS},
         "fwdDays": FORWARD_DAYS,
+        "horizonNames": {str(n): HORIZON_NAMES.get(n, f"{n} days") for n in FORWARD_DAYS},
         "target": TARGET_FWD_DAYS,
+        "optStart": int((win.index < opt_start).sum()),
+        "optStartDate": f"{opt_start:%Y-%m-%d}",
         "split": int((win.index < split_date).sum()),
         "splitDate": f"{split_date:%Y-%m-%d}",
+        "viewYears": DEFAULT_VIEW_YEARS,
+        "optYears": OPTIMIZER_YEARS,
         "meta": meta,
         "tfs": [{"tf": tf, "name": name} for tf, name, _ in TIMEFRAMES],
         "numNames": [{"name": n, "label": lab, "step": s} for n, lab, s, _ in NUM_FIELDS],
         "boolNames": [{"name": n, "label": lab} for n, lab in BOOL_FIELDS],
+        "slots": [{"id": s, "label": lab, "dir": d, "var": var} for s, lab, d, var, _ in SLOTS],
         "rules": {s: {"conds": rules[s]["conds"], "source": rules[s]["source"]} for s in rules},
-        "suggest": {s: {"rule": suggest[s]["rule"], "text": suggest[s]["text"], "train": suggest[s]["train"],
-                        "test": suggest[s]["test"], "singles": js_stats_rows(suggest[s]["singles"])}
-                    for s in suggest},
-        "opt": {"minDays": MIN_SIGNAL_DAYS, "minEp": MIN_EPISODES, "maxConds": MAX_RULE_CONDITIONS},
+        "suggest": {str(h): {s: sug(g) for s, g in by_slot.items()} for h, by_slot in suggest.items()},
+        "opt": {"minDays": MIN_SIGNAL_DAYS, "minEp": MIN_EPISODES, "maxConds": MAX_RULE_CONDITIONS,
+                "trainPct": round(TRAIN_FRACTION * 100)},
         "cap": COLOR_CAP_PCT, "heatCap": HEAT_CAP_PCT, "gradient": GRADIENT, "pending": PENDING_COLOR,
     }
 
@@ -713,8 +809,6 @@ def build_report(win, split_date, suggest, rules):
     html = (PAGE_TEMPLATE
             .replace("__TICKER__", TICKER)
             .replace("__PERIOD__", f"{start:%b %d, %Y} → {end:%b %d, %Y}")
-            .replace("__SPLIT__", f"{split_date:%b %d, %Y}")
-            .replace("__TRAINPCT__", f"{TRAIN_FRACTION * 100:.0f}")
             .replace("__CSV__", CSV_OUT.name)
             .replace("__SURFACE__", SURFACE).replace("__INK2__", INK_2)
             .replace("__INK__", INK).replace("__GRID__", GRID))
@@ -725,13 +819,13 @@ def build_report(win, split_date, suggest, rules):
 
     if os.environ.get("BACKTEST_OUTPUT_DIR"):
         st = latest_status(win, rules)
-        now = " + ".join(s.upper() for s in ("buy", "sell") if st[s]["fires"]) or "no signal"
+        now = " + ".join(SLOT_LABEL[s].upper() for s, *_ in SLOTS if st[s]["fires"]) or "no signal"
+        counts = ", ".join(f"{SLOT_LABEL[s]} {int(win[SLOT_COL[s]].sum())}" for s, *_ in SLOTS if rules[s]["conds"])
         (OUT_DIR / "scanner.json").write_text(json.dumps({
-            "title": SCANNER_TITLE,
+            "title": f"{TICKER} Multi-Timeframe Buy/Sell Signals - Backtest",
             "order": SCANNER_ORDER,
             "page": HTML_OUT.name,
-            "subtitle": f"{start:%b %d, %Y} to {end:%b %d, %Y} · buy rule fired {int(win['Buy_Signal'].sum())} days, "
-                        f"sell rule {int(win['Sell_Signal'].sum())} days · latest close: {now}",
+            "subtitle": f"{start:%b %d, %Y} to {end:%b %d, %Y} · signal days: {counts or 'no rules'} · latest close: {now}",
         }, indent=2), encoding="utf-8")
 
 
@@ -748,20 +842,25 @@ __PLOTLY__
   h2 { font-size:16px; font-weight:600; margin:4px 2px 8px; }
   .note { color:__INK2__; font-size:12px; margin:8px 2px; line-height:1.5; }
   .row { display:flex; flex-wrap:wrap; align-items:center; gap:10px 14px; }
-  .ctl { display:flex; align-items:center; gap:6px; font-size:13px; color:__INK2__; }
+  .ctl { display:flex; align-items:center; gap:6px; font-size:13px; color:__INK2__; flex-wrap:wrap; max-width:100%; }
   select, input { font:inherit; font-size:13px; padding:5px 6px; border:1px solid #c9c8c2; border-radius:6px; background:#fff; color:__INK__; }
+  select { max-width:100%; }
   input.n { width:62px; }
+  input[type=checkbox] { padding:0; }
   button { font:inherit; font-size:13px; padding:6px 11px; border:1px solid #c9c8c2; border-radius:6px; background:#fff; color:__INK__; cursor:pointer; }
   button:hover { background:#f0efec; }
-  .tabs { display:flex; gap:0; margin-bottom:10px; }
-  .tab { border-radius:0; padding:8px 18px; font-weight:600; }
-  .tab:first-child { border-radius:8px 0 0 8px; } .tab:last-child { border-radius:0 8px 8px 0; border-left:0; }
-  .tab.on.buy { background:#0b5a24; color:#fff; border-color:#0b5a24; }
-  .tab.on.sell { background:#8e1b1b; color:#fff; border-color:#8e1b1b; }
-  .today { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:16px; }
-  .badge { border-radius:10px; padding:12px 16px; min-width:260px; flex:1; border:1px solid __GRID__; background:#fff; }
+  button.sm { font-size:12px; padding:3px 8px; }
+  .tabs { display:flex; gap:0; flex-wrap:wrap; }
+  .tab { border-radius:0; padding:8px 16px; font-weight:600; border-left-width:0; }
+  .tab:first-child { border-radius:8px 0 0 8px; border-left-width:1px; } .tab:last-child { border-radius:0 8px 8px 0; }
+  .tab.on { color:#fff; }
+  .savebar { background:#f7f6f2; border-radius:8px; padding:8px 10px; margin:8px 0; }
+  .savebar .lbl { font-size:12px; font-weight:600; color:__INK2__; text-transform:uppercase; letter-spacing:.04em; }
+  .ok-msg { font-size:12px; color:#0b5a24; }
+  .today { display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:12px; margin-bottom:16px; }
+  .badge { border-radius:10px; padding:12px 16px; border:1px solid __GRID__; background:#fff; }
   .badge .t { font-size:12px; color:__INK2__; text-transform:uppercase; letter-spacing:.04em; }
-  .badge .v { font-size:22px; font-weight:700; margin:2px 0; }
+  .badge .v { font-size:20px; font-weight:700; margin:2px 0; }
   .badge .r { font-size:12px; color:__INK2__; line-height:1.45; }
   .badge.fire.buy { background:#e8f5ec; border-color:#4fae68; } .badge.fire.buy .v { color:#0b5a24; }
   .badge.fire.sell { background:#fbeaea; border-color:#e0584e; } .badge.fire.sell .v { color:#8e1b1b; }
@@ -769,6 +868,7 @@ __PLOTLY__
   th, td { text-align:left; padding:5px 7px; border-bottom:1px solid __GRID__; white-space:nowrap; }
   th { color:__INK2__; font-weight:500; }
   .num { text-align:right; font-variant-numeric:tabular-nums; }
+  .wrapcell { white-space:normal; min-width:220px; max-width:420px; }
   .tscroll { overflow-x:auto; }
   table.grid td { vertical-align:top; }
   table.grid td.lab { font-weight:500; padding-top:9px; }
@@ -779,12 +879,7 @@ __PLOTLY__
   .now.ok { color:#0b5a24; font-weight:600; }
   .now.bad { color:#8e1b1b; }
   tr.set td.tf.has { background:#f6f5f0; }
-  .tiles { display:flex; flex-wrap:wrap; gap:10px; margin:4px 0 6px; }
-  .tile { border:1px solid __GRID__; border-radius:8px; padding:8px 14px; min-width:112px; background:#fff; }
-  .tile .v { font-size:20px; font-weight:600; } .tile .l { font-size:12px; color:__INK2__; }
-  .sidehead { font-size:13px; font-weight:700; margin:8px 2px 2px; }
-  .sidehead.buy { color:#0b5a24; } .sidehead.sell { color:#8e1b1b; }
-  .rtext { font-size:13px; color:__INK2__; margin:2px 2px 6px; }
+  .chip { display:inline-block; font-size:11px; font-weight:700; padding:1px 7px; border-radius:10px; color:#fff; margin-right:3px; }
   table.heat td.c { text-align:center; cursor:pointer; min-width:54px; font-size:12px; border:2px solid #fff; border-radius:4px; }
   table.heat td.c:hover { outline:2px solid __INK__; }
   table.heat td.c.thin { opacity:.45; }
@@ -793,91 +888,131 @@ __PLOTLY__
   table.heat .rng { display:block; font-size:10px; opacity:.8; }
   .sw { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:-1px; border:1px solid rgba(0,0,0,.08); }
   tr.click { cursor:pointer; } tr.click:hover td { background:#f5f4f0; }
+  tr.pick td { background:#eef4fb; }
   .two { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
   .two > div { min-width:0; overflow-x:auto; }
-  select { max-width:100%; }
-  .ctl { flex-wrap:wrap; max-width:100%; }
   .hint { color:__INK2__; font-size:12px; }
   @media (max-width: 900px) { .two { grid-template-columns:1fr; } }
-  .pill { display:inline-block; font-size:11px; padding:1px 7px; border-radius:10px; background:#f0efec; color:__INK2__; margin-left:6px; }
+  .pill { display:inline-block; font-size:11px; padding:1px 7px; border-radius:10px; background:#f0efec; color:__INK2__; margin-left:6px; font-weight:500; }
+  .bk { display:inline-block; min-width:62px; text-align:center; border-radius:4px; padding:2px 4px; }
+  .callout { border-left:3px solid #2a78d6; background:#f3f7fc; padding:8px 12px; border-radius:4px; font-size:13px; margin:8px 0; line-height:1.5; }
+  td.b { font-weight:700; }
   a { color:#2a78d6; }
 </style></head><body><div class="wrap">
 <h1>__TICKER__ multi-timeframe buy &amp; sell signals: backtest</h1>
-<div class="sub">__PERIOD__ · every trading day replayed after the close with the notebook's indicators on the Daily,
-Weekly (week-to-date) and Monthly (month-to-date) timeframes. <b>Buy rule</b> = conditions followed by the highest forward
-returns; <b>sell rule</b> = conditions followed by the lowest. Colors show the forward return after a day:
+<div class="sub">Data __PERIOD__ · every trading day replayed after the close with the notebook's indicators on the Daily,
+Weekly (week-to-date) and Monthly (month-to-date) timeframes. Two <b>buy rules</b> (conditions followed by the highest forward
+returns) and two <b>sell rules</b> (followed by the lowest). Colors show the forward return after a day:
 <span class="sw" style="background:#0b5a24"></span>green = price rose afterwards,
-<span class="sw" style="background:#8e1b1b"></span>red = price fell. So good buy signals are green and good sell signals are red.
-Rules are suggested from the older __TRAINPCT__% of days and checked on days since __SPLIT__ (out-of-sample).</div>
+<span class="sw" style="background:#8e1b1b"></span>red = price fell. Good buy signals are green, good sell signals are red.
+Forward horizons are in trading days (about 21 per month). Everything below follows the date range you pick.</div>
 
 <div class="today" id="today"></div>
 
 <div class="card">
-  <div class="row" style="justify-content:space-between">
-    <div class="tabs"><button class="tab buy" data-side="buy">Buy rule</button><button class="tab sell" data-side="sell">Sell rule</button></div>
+  <div class="row" style="justify-content:space-between; margin-bottom:8px">
+    <div class="tabs" id="tabs"></div>
     <div class="row">
       <label class="ctl">Forward return <select id="horizon"></select></label>
-      <label class="ctl">Days <select id="period">
-        <option value="all">all days</option><option value="train">training period only</option>
-        <option value="test">test period only (since __SPLIT__)</option></select></label>
     </div>
   </div>
   <div class="row" style="margin-bottom:8px">
+    <label class="ctl">Date range <select id="period"></select></label>
+    <label class="ctl">from <input type="date" id="from"></label>
+    <label class="ctl">to <input type="date" id="to"></label>
+    <span class="pill" id="rangePill"></span>
+  </div>
+  <div class="row" style="margin-bottom:4px">
     <button id="resetBtn" title="The rule the scanner uses for email alerts">Reset to scanner rule</button>
     <button id="suggestBtn">Load suggested rule</button>
     <button id="clearBtn">Clear rule</button>
     <span class="note" id="ruleText" style="margin:0"></span>
   </div>
+  <div class="savebar">
+    <div class="row">
+      <span class="lbl">Save</span>
+      <input id="saveName" placeholder="name this rule" style="width:180px">
+      <button id="saveBtn">Save rule</button>
+      <select id="libSel" style="min-width:200px"></select>
+      <button id="libLoad">Load into this slot</button>
+      <button id="libDel">Delete</button>
+      <span style="flex:1"></span>
+      <button id="exportBtn" title="Download all four rules + your saved library as JSON">Export rules</button>
+      <button id="importBtn">Import rules</button><input type="file" id="importFile" accept=".json,application/json" style="display:none">
+      <button id="copyPy" title="Copy the four rules as Python settings">Copy as Python</button>
+    </div>
+    <div class="note" id="saveNote" style="margin:6px 0 0"></div>
+  </div>
   <div class="tscroll"><table class="grid" id="grid"></table></div>
-  <div class="note">All filled-in conditions must pass (AND). Leave a box empty for no limit. The small line under each box is
-  the latest close's value (green = passes this rule's condition). Numbers are on the notebook's scales: RSI, %K, %D and MFI 0 to 100,
-  CMF -1 to 1, MACD fields in dollars (the "% of price" versions compare better across years).</div>
+  <div class="note">All filled-in conditions must pass (AND). Leave a box empty for no limit; an empty rule never fires. The small line
+  under each box is the latest close's value (green = passes this rule's condition). Numbers are on the notebook's scales: RSI, %K, %D
+  and MFI 0 to 100, CMF -1 to 1, MACD fields in dollars (the "% of price" versions compare better across years).</div>
 </div>
 
-<div class="card"><h2>Rule results <span class="pill" id="periodPill"></span></h2>
-  <div class="sidehead buy">Buy rule</div><div class="rtext" id="buyText"></div><div class="tiles" id="buyTiles"></div>
-  <div class="sidehead sell">Sell rule</div><div class="rtext" id="sellText"></div><div class="tiles" id="sellTiles"></div>
-  <div class="note">"Edge" = rule's average forward return minus the average of all days in the same period. A buy rule wants a
+<div class="card"><h2>Rule results <span class="pill" id="resPill"></span></h2>
+  <div class="tscroll"><table id="results"></table></div>
+  <div class="note">"Edge" = the rule's average forward return minus the average of all days in the range. A buy rule wants a
   positive edge, a sell rule a negative one. Streaks = separate runs of consecutive signal days; consecutive days overlap in
   their forward windows, so streaks are the more honest count.</div>
 </div>
 
-<div class="card"><h2>Price with buy ▲ and sell ▼ signals</h2>
-  <div class="row"><label class="ctl"><input type="checkbox" id="logY" checked> log price scale</label></div>
-  <div id="priceChart"></div></div>
+<div class="card"><h2>Price with buy and sell signals</h2>
+  <div class="row">
+    <label class="ctl"><input type="checkbox" id="logY" checked> log price scale</label>
+    <label class="ctl"><input type="checkbox" id="showTrips"> draw round trips for</label>
+    <select id="chartPair"></select>
+  </div>
+  <div id="priceChart"></div>
+  <div class="note">Marker shape = rule (▲ Buy 1, ● Buy 2, ▼ Sell 1, ■ Sell 2), fill = forward return at the selected horizon.
+  Markers are drawn a little below (buys) or above (sells) the close so signals on the same day don't hide each other; hover shows the
+  actual close. Click a legend entry to hide a rule. Shaded area = the optimizer's test period.</div>
+</div>
+
+<div class="card"><h2>Round trips: how long from buy to sell <span class="pill" id="tripPill"></span></h2>
+  <div class="note" style="margin-top:0">Each trade buys at the close of a buy signal day and sells at the close of the next sell signal day
+  (later buy signals while holding are ignored). Hold time is in trading days, bucketed by the forward-return horizons, so you can see which
+  horizon matches how long a strategy actually holds.</div>
+  <div class="tscroll"><table id="trips"></table></div>
+  <div id="tripCallout"></div>
+  <div class="row" style="margin-top:6px"><label class="ctl">Trades for <select id="tripPair"></select></label></div>
+  <div class="tscroll"><table id="tradeList"></table></div>
+</div>
 
 <div class="card"><h2 id="heatTitle">Where the forward returns are: average by indicator value</h2>
   <div class="row" style="margin-bottom:6px">
     <label class="ctl">Days included <select id="heatCtx">
-      <option value="all">all days in the period</option>
+      <option value="all">all days in the range</option>
       <option value="rule">days passing the active rule's OTHER conditions</option></select></label>
-    <span class="note" style="margin:0">Each row splits that indicator's values into 10 equal-count ranges. Click a cell to set that range in the
-    active rule (the blue outline marks its current range). Faded = under 20 days.</span>
+    <span class="note" style="margin:0">Each row splits that indicator's values in the date range into 10 equal-count ranges. Click a cell to
+    set that range in the active rule (blue outline = its current range). Faded = under 20 days.</span>
   </div>
   <div class="tscroll"><table class="heat" id="heat"></table></div>
   <h2 style="margin-top:14px">Yes/no fields</h2>
   <div class="tscroll"><table class="heat" id="heatBool"></table></div>
 </div>
 
-<div class="card"><h2>Suggested rules</h2>
-  <div class="note">Searched on the training period only (before __SPLIT__): single thresholds at every 5th percentile of each
-  indicator plus the yes/no fields, then combined greedily up to <span id="optMax"></span> conditions. Each rule had to fire on at least
-  <span id="optDays"></span> days in <span id="optEp"></span>+ separate streaks. The <b>test</b> columns are days the search never saw, so they're the fair check. A rule that
-  looks great in training but not in test is probably luck. Raw-dollar MACD fields are left out of the search.</div>
+<div class="card"><h2>Suggested rules <span class="pill" id="sugPill"></span></h2>
+  <div class="note" id="sugNote"></div>
   <div class="two">
-    <div><div class="sidehead buy">Buy: combined rule</div><div id="sugBuy"></div></div>
-    <div><div class="sidehead sell">Sell: combined rule</div><div id="sugSell"></div></div>
+    <div><div id="sug_buy1"></div></div>
+    <div><div id="sug_sell1"></div></div>
   </div>
   <div class="two" style="margin-top:12px">
-    <div><div class="sidehead buy">Buy: best single conditions (click to add to buy rule)</div><div class="tscroll"><table id="singBuy"></table></div></div>
-    <div><div class="sidehead sell">Sell: best single conditions (click to add to sell rule)</div><div class="tscroll"><table id="singSell"></table></div></div>
+    <div><div id="sug_buy2"></div></div>
+    <div><div id="sug_sell2"></div></div>
+  </div>
+  <div class="two" style="margin-top:12px">
+    <div><h2 style="font-size:14px;color:#0b5a24">Buy: best single conditions (click to add to the active buy rule)</h2><div class="tscroll"><table id="singBuy"></table></div></div>
+    <div><h2 style="font-size:14px;color:#8e1b1b">Sell: best single conditions (click to add to the active sell rule)</h2><div class="tscroll"><table id="singSell"></table></div></div>
   </div>
 </div>
 
-<div class="card"><h2 id="hitsTitle">Recent signal days</h2>
+<div class="card"><h2 id="hitsTitle">Signal days</h2>
+  <div class="row" id="hitSlots" style="margin-bottom:6px"></div>
   <div class="tscroll"><table id="hits"></table></div>
-  <div class="note"><a href="__CSV__" download>Download every day with all indicators (CSV)</a>. Buy_Signal / Sell_Signal = the scanner's
-  alert rules. Backtest uses split-adjusted prices, ignores costs and taxes, and is not financial advice.</div>
+  <div class="note">Every day in the range where a selected rule fired, newest first (up to 150 rows; tick "first day of each streak only" to see further back). Indicator columns cover every field used
+  by the selected rules; bold = that field is part of a rule that fired that day. <a href="__CSV__" download>Download every day with all
+  indicators (CSV)</a>. Backtest uses split-adjusted prices, ignores costs and taxes, and is not financial advice.</div>
 </div>
 </div>
 
@@ -887,8 +1022,16 @@ const N = D.dates.length, F = D.feats;
 const SURF = '__SURFACE__', INK = '__INK__', INK2 = '__INK2__', GRIDC = '__GRID__';
 const $ = id => document.getElementById(id);
 const MK = Object.fromEntries(D.meta.map(m => [m.k, m]));
-let side = 'buy', H = String(D.target);
-const state = {buy: {}, sell: {}};
+const SLOTS = D.slots, SL = Object.fromEntries(SLOTS.map(s => [s.id, s]));
+const STY = {
+  buy1: {sym: 'triangle-up', col: '#0b5a24', off: 0.96, short: 'B1', mark: '▲'},
+  buy2: {sym: 'circle', col: '#2a78d6', off: 0.92, short: 'B2', mark: '●'},
+  sell1: {sym: 'triangle-down', col: '#8e1b1b', off: 1.04, short: 'S1', mark: '▼'},
+  sell2: {sym: 'square', col: '#7b3fb0', off: 1.08, short: 'S2', mark: '■'},
+};
+const BUYS = SLOTS.filter(s => s.dir > 0).map(s => s.id), SELLS = SLOTS.filter(s => s.dir < 0).map(s => s.id);
+let side = 'buy1', H = String(D.target), RA = 0, RB = N - 1;
+const state = Object.fromEntries(SLOTS.map(s => [s.id, {}]));
 
 // ---------- helpers ----------
 const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
@@ -904,14 +1047,19 @@ function color(v, cap) {
   }
   return g[g.length - 1][1];
 }
+// longer horizons have bigger moves, so the color scale widens with sqrt(time)
+const capFor = (h, base) => Math.max(1, Math.round(base * Math.sqrt(Number(h) / 10)));
 const txtColor = (v, cap) => (v === null || Math.abs(v) / cap < 0.45) ? INK : '#fff';
 const pct = (v, d = 2) => v === null || v === undefined ? 'n/a' : (v > 0 ? '+' : '') + v.toFixed(d) + '%';
 const mean = a => a.length ? a.reduce((s, v) => s + v, 0) / a.length : null;
-function median(a) { if (!a.length) return null; const s = [...a].sort((x, y) => x - y), m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; }
+function quant(a, q) { if (!a.length) return null; const s = [...a].sort((x, y) => x - y), p = (s.length - 1) * q, lo = Math.floor(p), hi = Math.ceil(p); return s[lo] + (s[hi] - s[lo]) * (p - lo); }
+const median = a => quant(a, 0.5);
 const fmtNum = v => v === null ? 'n/a' : (Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2));
 const fmtVal = (k, v) => v === null ? 'n/a' : MK[k].kind === 'bool' ? (v ? 'yes' : 'no') : fmtNum(v);
-const sideColor = s => s === 'buy' ? '#0b5a24' : '#8e1b1b';
-const inPeriod = i => { const p = $('period').value; return p === 'all' || (p === 'train' ? i < D.split : i >= D.split); };
+const fmtDate = s => new Date(s + 'T00:00:00Z').toLocaleDateString('en-US', {month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC'});
+const hName = h => `${h} days (${D.horizonNames[String(h)]})`;
+const chip = s => `<span class="chip" style="background:${STY[s].col}">${STY[s].short}</span>`;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
 
 // ---------- rules ----------
 function condsToState(conds) {
@@ -928,7 +1076,7 @@ function condOk(v, e) {
   if (e.max != null && v > e.max) return false;
   return true;
 }
-function ruleKeys(s, exclude) { return Object.keys(state[s]).filter(k => k !== exclude && active(state[s][k])); }
+function ruleKeys(s, exclude) { return Object.keys(state[s]).filter(k => k !== exclude && MK[k] && active(state[s][k])); }
 function mask(s, exclude, emptyAll) {
   const keys = ruleKeys(s, exclude), m = new Array(N);
   if (!keys.length) return m.fill(!!emptyAll);
@@ -946,9 +1094,91 @@ function ruleDesc(s) {
     return e.min != null ? `${lab} ≥ ${e.min}` : `${lab} ≤ ${e.max}`; }).join(' AND ');
 }
 
+// ---------- saving: python-style rule format {field: [min, max] | true/false} ----------
+function toPy(s) {
+  const o = {};
+  ruleKeys(s).forEach(k => { const e = state[s][k];
+    o[k] = e.sel != null ? e.sel === 1 : [e.min ?? null, e.max ?? null]; });
+  return o;
+}
+function fromPy(o) {
+  const s = {};
+  Object.entries(o || {}).forEach(([k, v]) => {
+    if (!MK[k] || v === null) return;
+    if (typeof v === 'boolean') s[k] = {sel: v ? 1 : 0};
+    else if (Array.isArray(v)) s[k] = {min: v[0] ?? null, max: v[1] ?? null};
+  });
+  return s;
+}
+const STORE = (() => { try { const t = '__mtf'; localStorage.setItem(t, '1'); localStorage.removeItem(t); return localStorage; } catch (e) { return null; } })();
+const KEY_CUR = `mtfScanner:${D.ticker}:current`, KEY_LIB = 'mtfScanner:library';
+function sget(k) { try { return STORE ? JSON.parse(STORE.getItem(k)) : null; } catch (e) { return null; } }
+function sset(k, v) { try { if (!STORE) return false; STORE.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } }
+let library = sget(KEY_LIB) || [];
+function autosave() {
+  sset(KEY_CUR, {rules: Object.fromEntries(SLOTS.map(s => [s.id, toPy(s.id)])), H, period: $('period').value,
+    from: $('from').value, to: $('to').value, side});
+}
+function note(msg) { $('saveNote').innerHTML = msg; }
+function baseNote() {
+  note(STORE ? `Your inputs autosave in this browser. Saved rules (${library.length}) are shared across tickers. <b>Export rules</b> downloads
+    <code>mtf_signal_rules_${esc(D.ticker)}.json</code>: put it next to the script and the scanner uses those four rules for alerts.`
+    : `This browser is blocking storage, so inputs won't be remembered here. Use <b>Export rules</b> to keep them in a file.`);
+}
+function drawLib() {
+  $('libSel').innerHTML = library.length ? library.map((r, j) => `<option value="${j}">[${r.kind}] ${esc(r.name)}</option>`).join('')
+    : '<option value="">no saved rules yet</option>';
+}
+function download(name, text) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], {type: 'application/json'}));
+  a.download = name; document.body.appendChild(a); a.click(); a.remove();
+}
+function pyText() {
+  const lit = v => v === null ? 'None' : v === true ? 'True' : v === false ? 'False' : String(v);
+  return SLOTS.map(s => { const o = toPy(s.id), ks = Object.keys(o);
+    if (!ks.length) return `${s.var} = None`;
+    return `${s.var} = {\n` + ks.map(k => `    "${k}": ${Array.isArray(o[k]) ? `(${lit(o[k][0])}, ${lit(o[k][1])})` : lit(o[k])},`).join('\n') + '\n}';
+  }).join('\n');
+}
+
+// ---------- date range ----------
+function firstOnOrAfter(d) { let lo = 0, hi = N - 1; while (lo < hi) { const m = (lo + hi) >> 1; if (D.dates[m] < d) lo = m + 1; else hi = m; } return lo; }
+function lastOnOrBefore(d) { let lo = 0, hi = N - 1; while (lo < hi) { const m = (lo + hi + 1) >> 1; if (D.dates[m] > d) hi = m - 1; else lo = m; } return lo; }
+function yearsBack(y) { const d = new Date(D.dates[N - 1] + 'T00:00:00Z'); d.setUTCFullYear(d.getUTCFullYear() - y); return d.toISOString().slice(0, 10); }
+function periodOptions() {
+  const yrs = (new Date(D.dates[N - 1]) - new Date(D.dates[0])) / 3.156e10, o = [];
+  [1, 3, 5, 10].forEach(y => { if (y < yrs - 0.05) o.push([`${y}y`, `last ${y} year${y > 1 ? 's' : ''}`]); });
+  o.push(['all', `all data (since ${fmtDate(D.dates[0])})`]);
+  o.push(['train', `optimizer training days (${fmtDate(D.optStartDate)} to ${fmtDate(D.dates[D.split - 1])})`]);
+  o.push(['test', `optimizer test days (since ${fmtDate(D.splitDate)})`]);
+  o.push(['custom', 'custom dates']);
+  $('period').innerHTML = o.map(([v, t]) => `<option value="${v}">${t}</option>`).join('');
+  const def = `${D.viewYears}y`;
+  $('period').value = o.some(x => x[0] === def) ? def : 'all';
+}
+function applyPeriod() {
+  const p = $('period').value;
+  if (p === 'custom') {
+    RA = firstOnOrAfter($('from').value || D.dates[0]); RB = lastOnOrBefore($('to').value || D.dates[N - 1]);
+    if (RB < RA) [RA, RB] = [RB, RA];
+  } else {
+    RA = 0; RB = N - 1;
+    if (p.endsWith('y')) RA = firstOnOrAfter(yearsBack(parseInt(p)));
+    else if (p === 'train') { RA = D.optStart; RB = D.split - 1; }
+    else if (p === 'test') RA = D.split;
+  }
+  $('from').value = D.dates[RA]; $('to').value = D.dates[RB];
+  $('rangePill').textContent = `${fmtDate(D.dates[RA])} → ${fmtDate(D.dates[RB])} · ${(RB - RA + 1).toLocaleString()} trading days`;
+}
+
 // ---------- rule grid ----------
+function drawTabs() {
+  $('tabs').innerHTML = SLOTS.map(s => `<button class="tab${s.id === side ? ' on' : ''}" data-side="${s.id}" style="${s.id === side ?
+    `background:${STY[s.id].col};border-color:${STY[s.id].col}` : `color:${STY[s.id].col}`}">${STY[s.id].mark} ${s.label}</button>`).join('');
+  $('tabs').querySelectorAll('.tab').forEach(b => b.onclick = () => { side = b.dataset.side; drawTabs(); fillGrid(); render(); });
+}
 function drawGrid() {
-  document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.side === side));
   let h = '<tr><th>Indicator</th>' + D.tfs.map(t => `<th class="tf">${t.name}</th>`).join('') + '</tr>';
   D.numNames.forEach(n => {
     h += `<tr class="set"><td class="lab">${n.label}</td>` + D.tfs.map(t => {
@@ -968,10 +1198,9 @@ function drawGrid() {
   $('grid').querySelectorAll('input, select').forEach(el => el.addEventListener('change', () => {
     const k = el.dataset.k, b = el.dataset.b, e = state[side][k] || (state[side][k] = {});
     const v = el.value.trim();
-    if (b === 'sel') e.sel = v === '' ? null : Number(v); else e[b] = v === '' ? null : Number(v);
+    e[b] = v === '' ? null : Number(v);
     render();
   }));
-  fillGrid();
 }
 function fillGrid() {
   $('grid').querySelectorAll('input, select').forEach(el => {
@@ -984,51 +1213,123 @@ function fillGrid() {
     el.textContent = 'latest: ' + fmtVal(k, v);
     el.className = 'now' + (active(e) ? (condOk(v, e) ? ' ok' : ' bad') : '');
   });
+  const src = {auto: 'optimizer suggestion', settings: 'script settings', saved: 'saved rules file'}[D.rules[side].source];
+  $('ruleText').textContent = `Editing ${SL[side].label}` + (ruleKeys(side).length ? '' : ' (empty)') + ` · scanner's alert rule comes from the ${src}`;
 }
 
-// ---------- stats ----------
+// ---------- stats (inside the date range) ----------
 function statsOf(m, h) {
-  const idx = []; for (let i = 0; i < N; i++) if (m[i] && inPeriod(i)) idx.push(i);
-  const set = new Set(idx); let ep = 0; idx.forEach(i => { if (!set.has(i - 1)) ep++; });
+  const idx = []; let ep = 0;
+  for (let i = RA; i <= RB; i++) if (m[i]) { idx.push(i); if (i === RA || !m[i - 1]) ep++; }
   const v = idx.map(i => D.fwd[h][i]).filter(x => x !== null);
-  return {idx, n: idx.length, ep, avg: mean(v), med: median(v), win: v.length ? v.filter(x => x > 0).length / v.length * 100 : null, nres: v.length};
+  return {idx, n: idx.length, ep, avg: mean(v), med: median(v), win: v.length ? v.filter(x => x > 0).length / v.length * 100 : null};
 }
-function baseline(h) { const all = new Array(N).fill(true); return statsOf(all, h); }
+function baseline(h) { const v = []; for (let i = RA; i <= RB; i++) if (D.fwd[h][i] !== null) v.push(D.fwd[h][i]); return mean(v); }
 
-function tiles(s, m) {
-  const st = statsOf(m, H), b = baseline(H), edge = st.avg === null || b.avg === null ? null : st.avg - b.avg;
-  const t = [
-    [st.n.toLocaleString(), 'signal days'],
-    [st.ep, 'separate streaks'],
-    [pct(st.avg), `avg ${H}D forward`],
-    [pct(st.med), `median ${H}D`],
-    [st.win === null ? 'n/a' : st.win.toFixed(0) + '%', `${H}D positive`],
-    [edge === null ? 'n/a' : pct(edge), 'edge vs all days'],
-    [pct(b.avg), `all days avg ${H}D`],
-  ];
-  $(s + 'Tiles').innerHTML = t.map(([v, l], j) => {
-    const sw = (j === 2 && st.avg !== null) ? `<span class="sw" style="background:${color(st.avg, D.heatCap)}"></span>` : '';
-    return `<div class="tile"><div class="v">${sw}${v}</div><div class="l">${l}</div></div>`; }).join('');
-  $(s + 'Text').textContent = ruleDesc(s);
-  return st;
+function results(ST) {
+  const b = baseline(H), hc = capFor(H, D.heatCap);
+  $('resPill').textContent = `${hName(H)} forward · ${$('rangePill').textContent}`;
+  $('results').innerHTML = `<tr><th>Rule</th><th>Conditions</th><th class="num">Signal days</th><th class="num">Streaks</th><th class="num">Avg ${H}D</th>` +
+    `<th class="num">Median ${H}D</th><th class="num">% positive</th><th class="num">Edge vs all days</th></tr>` +
+    SLOTS.map(s => { const st = ST[s.id], edge = st.avg === null || b === null ? null : st.avg - b;
+      const good = edge === null ? '' : (edge * s.dir > 0 ? 'color:#0b5a24' : 'color:#8e1b1b');
+      return `<tr><td>${chip(s.id)} ${s.label}</td><td class="wrapcell hint">${esc(ruleDesc(s.id))}</td><td class="num">${st.n.toLocaleString()}</td>` +
+        `<td class="num">${st.ep}</td><td class="num"><span class="sw" style="background:${color(st.avg, hc)}"></span>${pct(st.avg)}</td>` +
+        `<td class="num">${pct(st.med)}</td><td class="num">${st.win === null ? 'n/a' : st.win.toFixed(0) + '%'}</td>` +
+        `<td class="num" style="${good};font-weight:600">${pct(edge)}</td></tr>`; }).join('') +
+    `<tr><td class="hint">All days</td><td class="hint">every trading day in the range</td><td></td><td></td><td class="num">${pct(b)}</td><td></td><td></td><td></td></tr>`;
 }
 
 // ---------- today ----------
-function today(mb, ms) {
+function today(M) {
   const d = new Date(D.dates[N - 1] + 'T00:00:00Z').toLocaleDateString('en-US', {weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC'});
-  const one = (s, m) => {
-    const keys = ruleKeys(s); let streak = 0; for (let i = N - 1; i >= 0 && m[i]; i--) streak++;
+  $('today').innerHTML = SLOTS.map(s => {
+    const m = M[s.id], keys = ruleKeys(s.id), kind = s.dir > 0 ? 'buy' : 'sell';
+    let streak = 0; for (let i = N - 1; i >= 0 && m[i]; i--) streak++;
     const fires = keys.length && m[N - 1];
-    const detail = keys.length ? keys.map(k => `${MK[k].tfName} ${MK[k].label}: ${fmtVal(k, F[k][N - 1])} ${condOk(F[k][N - 1], state[s][k]) ? '✓' : '✗'}`).join(' · ') : 'no conditions set';
-    return `<div class="badge ${s} ${fires ? 'fire' : ''}"><div class="t">${s} rule on the latest close (${d}, $${D.close[N - 1].toFixed(2)})</div>` +
-      `<div class="v">${fires ? (s === 'buy' ? 'BUY signal' : 'SELL signal') + (streak > 1 ? ` · day ${streak}` : '') : 'No ' + s + ' signal'}</div><div class="r">${detail}</div></div>`;
-  };
-  $('today').innerHTML = one('buy', mb) + one('sell', ms);
+    const detail = keys.length ? keys.map(k => `${MK[k].tfName} ${MK[k].label}: ${fmtVal(k, F[k][N - 1])} ${condOk(F[k][N - 1], state[s.id][k]) ? '✓' : '✗'}`).join(' · ') : 'no conditions set';
+    return `<div class="badge ${kind} ${fires ? 'fire' : ''}"><div class="t">${chip(s.id)}${s.label} on ${d} close ($${D.close[N - 1].toFixed(2)})</div>` +
+      `<div class="v">${fires ? s.label.toUpperCase() + ' signal' + (streak > 1 ? ` · day ${streak}` : '') : 'No signal'}</div><div class="r">${detail}</div></div>`;
+  }).join('');
+}
+
+// ---------- round trips ----------
+function pairs() {
+  const out = [];
+  BUYS.forEach(b => SELLS.forEach(s => out.push({id: `${b}>${s}`, b: [b], s: [s], label: `${SL[b].label} → ${SL[s].label}`})));
+  out.push({id: 'any>any', b: BUYS, s: SELLS, label: 'Either buy → either sell'});
+  return out;
+}
+const PAIRS = pairs();
+function orMask(M, ids) { const m = new Array(N).fill(false); ids.forEach(id => { for (let i = 0; i < N; i++) if (M[id][i]) m[i] = true; }); return m; }
+function tradesFor(M, p) {
+  const bm = orMask(M, p.b), sm = orMask(M, p.s), out = [];
+  const mk = (e, x, open) => ({e, x, open, hold: x - e, cal: Math.round((new Date(D.dates[x]) - new Date(D.dates[e])) / 864e5),
+    ret: (D.close[x] / D.close[e] - 1) * 100});
+  let e = -1;
+  for (let i = RA; i <= RB; i++) {
+    if (e < 0) { if (bm[i]) e = i; }
+    else if (sm[i]) { out.push(mk(e, i, false)); e = -1; }
+  }
+  if (e >= 0) out.push(mk(e, RB, true));
+  return out;
+}
+function buckets() {
+  const b = []; let lo = 1;
+  D.fwdDays.forEach(n => { b.push({lo, hi: n, label: lo === 1 ? `≤${n}` : `${lo}–${n}`, h: n}); lo = n + 1; });
+  b.push({lo, hi: Infinity, label: `${lo}+`, h: null});
+  return b;
+}
+const BK = buckets();
+function trips(M) {
+  const hasRule = id => ruleKeys(id).length > 0;
+  $('tripPill').textContent = $('rangePill').textContent;
+  let best = null;
+  const rows = PAIRS.map(p => {
+    const ok = p.b.some(hasRule) && p.s.some(hasRule);
+    if (!ok) return `<tr><td>${p.label}</td><td colspan="${6 + BK.length}" class="hint">one of these rules is empty</td></tr>`;
+    const T = tradesFor(M, p), C = T.filter(t => !t.open), open = T.find(t => t.open);
+    const holds = C.map(t => t.hold), rets = C.map(t => t.ret);
+    const cnt = BK.map(k => holds.filter(h => h >= k.lo && h <= k.hi).length), mx = Math.max(1, ...cnt);
+    const med = median(holds);
+    if (p.id === $('tripPair').value && med !== null) best = {p, med, q1: quant(holds, .25), q3: quant(holds, .75), n: C.length, avgRet: mean(rets)};
+    return `<tr class="click${p.id === $('tripPair').value ? ' pick' : ''}" data-pair="${p.id}"><td>${p.label}</td>` +
+      `<td class="num">${C.length}${open ? ' <span class="hint">+1 open</span>' : ''}</td>` +
+      `<td class="num">${med === null ? 'n/a' : med.toFixed(0)}</td>` +
+      `<td class="num">${holds.length ? `${quant(holds, .25).toFixed(0)}–${quant(holds, .75).toFixed(0)}` : 'n/a'}</td>` +
+      `<td class="num">${C.length ? mean(C.map(t => t.cal)).toFixed(0) : 'n/a'}</td>` +
+      `<td class="num"><span class="sw" style="background:${color(mean(rets), capFor(med || 10, D.heatCap))}"></span>${pct(mean(rets))}</td>` +
+      `<td class="num">${rets.length ? (rets.filter(r => r > 0).length / rets.length * 100).toFixed(0) + '%' : 'n/a'}</td>` +
+      cnt.map(c => `<td class="num"><span class="bk" style="background:rgba(42,120,214,${(c / mx * 0.35).toFixed(2)})">${c}${holds.length ? ` · ${(c / holds.length * 100).toFixed(0)}%` : ''}</span></td>`).join('') + '</tr>';
+  });
+  $('trips').innerHTML = `<tr><th>Pair</th><th class="num">Trades</th><th class="num">Median hold</th><th class="num">Middle 50%</th>` +
+    `<th class="num">Avg cal. days</th><th class="num">Avg return</th><th class="num">% winners</th>` +
+    BK.map(k => `<th class="num">${k.label} d</th>`).join('') + '</tr>' + rows.join('');
+  $('trips').querySelectorAll('tr.click').forEach(tr => tr.onclick = () => { $('tripPair').value = tr.dataset.pair; $('chartPair').value = tr.dataset.pair; render(); });
+
+  if (best) {
+    const near = D.fwdDays.reduce((a, n) => Math.abs(n - best.med) < Math.abs(a - best.med) ? n : a, D.fwdDays[0]);
+    $('tripCallout').innerHTML = `<div class="callout"><b>${best.p.label}</b>: median hold <b>${best.med.toFixed(0)} trading days</b>
+      (middle half of trades ${best.q1.toFixed(0)} to ${best.q3.toFixed(0)} days) over ${best.n} closed trades, avg return ${pct(best.avgRet)}.
+      The closest forward-return horizon is <b>${hName(near)}</b>${String(near) === H ? ' (already selected)' : ` <button class="sm" id="useH" data-h="${near}">use it</button>`}.
+      Tuning the buy rule on that horizon makes its forward returns match how long this pair actually holds.</div>`;
+    const u = $('useH'); if (u) u.onclick = () => { H = u.dataset.h; $('horizon').value = H; render(); };
+  } else $('tripCallout').innerHTML = '';
+
+  const p = PAIRS.find(x => x.id === $('tripPair').value);
+  const T = p && p.b.some(hasRule) && p.s.some(hasRule) ? tradesFor(M, p) : [];
+  $('tradeList').innerHTML = `<tr><th>Bought</th><th class="num">Buy close</th><th>Sold</th><th class="num">Sell close</th>` +
+    `<th class="num">Hold (trading days)</th><th class="num">Calendar days</th><th class="num">Return</th></tr>` +
+    (T.length ? T.slice(-30).reverse().map(t => { const cp = capFor(Math.max(t.hold, 5), D.cap);
+      return `<tr><td>${D.dates[t.e]}</td><td class="num">$${D.close[t.e].toFixed(2)}</td><td>${t.open ? '<i>still open</i>' : D.dates[t.x]}</td>` +
+        `<td class="num">$${D.close[t.x].toFixed(2)}${t.open ? ' <span class="hint">(latest)</span>' : ''}</td><td class="num">${t.hold}</td><td class="num">${t.cal}</td>` +
+        `<td class="num" style="background:${color(t.ret, cp)};color:${txtColor(t.ret, cp)}">${pct(t.ret)}</td></tr>`; }).join('')
+      : '<tr><td colspan="7" class="note">No trades for this pair in the range.</td></tr>');
+  return T;
 }
 
 // ---------- price chart ----------
-function scaleTrace(x0) {
-  const cap = D.cap;
+function scaleTrace(x0, cap) {
   return {type: 'scatter', x: [x0], y: [null], mode: 'markers', hoverinfo: 'skip', showlegend: false,
     marker: {size: 0.1, opacity: 0, color: [0], cmin: -cap, cmax: cap, showscale: true,
       colorscale: D.gradient.map(([p, c]) => [(p + 1) / 2, c]),
@@ -1037,29 +1338,63 @@ function scaleTrace(x0) {
         ticktext: [`≤ -${cap}%`, `-${cap / 2}%`, '0%', `+${cap / 2}%`, `≥ +${cap}%`],
         title: {text: `${H}D forward return`, side: 'top', font: {size: 11}}}}};
 }
-function chart(sb, ss) {
-  const tr = [{type: 'scatter', mode: 'lines', x: D.dates, y: D.close, name: 'Close', line: {color: '#8a8984', width: 1.2},
+function chart(ST, M) {
+  const cap = capFor(H, D.cap), xs = D.dates.slice(RA, RB + 1);
+  const tr = [{type: 'scatter', mode: 'lines', x: xs, y: D.close.slice(RA, RB + 1), name: 'Close', line: {color: '#8a8984', width: 1.2},
     hovertemplate: '%{x|%b %d, %Y}<br>Close $%{y:,.2f}<extra></extra>', showlegend: false}];
-  const mk = (st, s) => {
-    const x = [], y = [], c = [], cd = [];
-    st.idx.forEach(i => { const v = D.fwd[H][i]; x.push(D.dates[i]); y.push(D.close[i]); c.push(color(v, D.cap));
-      cd.push(D.fwdDays.map(n => pct(D.fwd[String(n)][i]))); });
-    return {type: 'scatter', mode: 'markers', x, y, customdata: cd, name: s === 'buy' ? 'Buy ▲' : 'Sell ▼', showlegend: false,
-      marker: {symbol: s === 'buy' ? 'triangle-up' : 'triangle-down', size: 10, color: c, line: {color: sideColor(s), width: 1.2}},
-      hovertemplate: `<b>${s.toUpperCase()}</b> %{x|%b %d, %Y}<br>Close $%{y:,.2f}<br>` +
-        D.fwdDays.map((n, j) => `${n}D fwd: %{customdata[${j}]}`).join(' · ') + '<extra></extra>'};
-  };
-  tr.push(mk(sb, 'buy'), mk(ss, 'sell'), scaleTrace(D.dates[0]));
-  const lay = {height: 520, margin: {l: 60, r: 20, t: 60, b: 40}, plot_bgcolor: SURF, paper_bgcolor: '#fff', uirevision: 'keep',
+  SLOTS.forEach(s => {
+    if (!ruleKeys(s.id).length) return;
+    const st = ST[s.id], y = STY[s.id], X = [], Y = [], c = [], cd = [];
+    st.idx.forEach(i => { X.push(D.dates[i]); Y.push(D.close[i] * y.off); c.push(color(D.fwd[H][i], cap));
+      cd.push([D.close[i], ...D.fwdDays.map(n => pct(D.fwd[String(n)][i]))]); });
+    tr.push({type: 'scatter', mode: 'markers', x: X, y: Y, customdata: cd, name: `${s.label} (${st.n})`,
+      marker: {symbol: y.sym, size: s.id.endsWith('2') ? 9 : 10, color: c, line: {color: y.col, width: 1.4}},
+      hovertemplate: `<b>${s.label.toUpperCase()}</b> %{x|%b %d, %Y}<br>Close $%{customdata[0]:,.2f}<br>` +
+        D.fwdDays.map((n, j) => `${n}D fwd: %{customdata[${j + 1}]}`).join(' · ') + '<extra></extra>'});
+  });
+  if ($('showTrips').checked) {
+    const p = PAIRS.find(x => x.id === $('chartPair').value);
+    if (p && p.b.some(id => ruleKeys(id).length) && p.s.some(id => ruleKeys(id).length)) {
+      const T = tradesFor(M, p);
+      [[true, '#1f8a44', 'wins'], [false, '#c0392b', 'losses']].forEach(([w, col, lab]) => {
+        const X = [], Y = [], tx = [];
+        T.filter(t => (t.ret > 0) === w).forEach(t => { X.push(D.dates[t.e], D.dates[t.x], null); Y.push(D.close[t.e], D.close[t.x], null);
+          const s = `${D.dates[t.e]} → ${t.open ? 'open' : D.dates[t.x]} · ${t.hold} trading days · ${pct(t.ret)}`; tx.push(s, s, null); });
+        tr.push({type: 'scatter', mode: 'lines', x: X, y: Y, text: tx, name: `${p.label}: ${lab}`, line: {color: col, width: 3},
+          opacity: 0.75, hovertemplate: '%{text}<extra></extra>', connectgaps: false});
+      });
+    }
+  }
+  tr.push(scaleTrace(xs[0], cap));
+  const shapes = [], ann = [];
+  if (D.split <= RB) {
+    const x0 = D.dates[Math.max(D.split, RA)];
+    shapes.push({type: 'rect', xref: 'x', yref: 'paper', x0, x1: D.dates[RB], y0: 0, y1: 1, fillcolor: '#2a78d6', opacity: 0.05, line: {width: 0}});
+    ann.push({x: x0, y: 1, xref: 'x', yref: 'paper', text: 'test period →', showarrow: false, xanchor: 'left', yanchor: 'top', font: {size: 11, color: '#2a78d6'}});
+  }
+  const lay = {height: 560, margin: {l: 60, r: 20, t: 80, b: 40}, plot_bgcolor: SURF, paper_bgcolor: '#fff', uirevision: `${RA}-${RB}`,
     font: {family: 'Inter, Segoe UI, Arial, sans-serif', color: INK2, size: 12}, hoverlabel: {bgcolor: '#fff', font: {color: INK}},
-    xaxis: {showgrid: false, linecolor: GRIDC, rangeslider: {visible: true, thickness: 0.06}},
-    yaxis: {type: $('logY').checked ? 'log' : 'linear', gridcolor: GRIDC, tickprefix: '$'},
-    shapes: [{type: 'rect', xref: 'x', yref: 'paper', x0: D.splitDate, x1: D.dates[N - 1], y0: 0, y1: 1, fillcolor: '#2a78d6', opacity: 0.05, line: {width: 0}}],
-    annotations: [{x: D.splitDate, y: 1, xref: 'x', yref: 'paper', text: 'test period →', showarrow: false, xanchor: 'left', yanchor: 'top', font: {size: 11, color: '#2a78d6'}}]};
+    legend: {orientation: 'h', x: 0, xanchor: 'left', y: 1.02, yanchor: 'bottom', font: {size: 11}},
+    xaxis: {showgrid: false, linecolor: GRIDC, range: [D.dates[RA], D.dates[RB]], rangeslider: {visible: true, thickness: 0.06, range: [D.dates[RA], D.dates[RB]]}},
+    yaxis: {type: $('logY').checked ? 'log' : 'linear', gridcolor: GRIDC, tickprefix: '$'}, shapes, annotations: ann};
   Plotly.react('priceChart', tr, lay, {displaylogo: false, responsive: true});
 }
 
-// ---------- heatmap ----------
+// ---------- heatmap (bins from the values inside the date range) ----------
+let edgeCache = {key: '', E: {}};
+function edgesFor(k) {
+  const ck = `${RA}-${RB}`;
+  if (edgeCache.key !== ck) edgeCache = {key: ck, E: {}};
+  if (edgeCache.E[k]) return edgeCache.E[k];
+  const v = []; for (let i = RA; i <= RB; i++) if (F[k][i] !== null) v.push(F[k][i]);
+  v.sort((a, b) => a - b);
+  const nd = MK[k].nd, e = [];
+  if (v.length) for (let q = 0; q <= 10; q++) {
+    const p = (v.length - 1) * q / 10, lo = Math.floor(p), x = Number((v[lo] + (v[Math.ceil(p)] - v[lo]) * (p - lo)).toFixed(nd));
+    if (!e.length || x > e[e.length - 1]) e.push(x);
+  }
+  return (edgeCache.E[k] = e.length >= 2 ? e : (e.length ? [e[0], e[0]] : [0, 0]));
+}
 function binOf(edges, v) {
   if (v === null) return -1;
   const nb = edges.length - 1;
@@ -1067,26 +1402,27 @@ function binOf(edges, v) {
   return -1;
 }
 function heat() {
-  const ctx = $('heatCtx').value, h = H, cap = D.heatCap;
+  const ctx = $('heatCtx').value, h = H, cap = capFor(H, D.heatCap);
   $('heatTitle').textContent = `Where the forward returns are: average ${h}-day forward return by indicator value` +
-    (ctx === 'rule' ? ` (${side} rule context)` : '');
-  const maxB = Math.max(...D.meta.filter(m => m.kind === 'num').map(m => m.edges.length - 1));
+    (ctx === 'rule' ? ` (${SL[side].label} rule context)` : '');
+  const E = Object.fromEntries(D.meta.filter(m => m.kind === 'num').map(m => [m.k, edgesFor(m.k)]));
+  const maxB = Math.max(...Object.values(E).map(e => e.length - 1));
   let out = '';
   D.tfs.forEach(t => {
     out += `<tr class="tfh"><td colspan="${maxB + 1}">${t.name}</td></tr>`;
     D.numNames.forEach(n => {
-      const k = `${t.tf}_${n.name}`, m = MK[k], nb = m.edges.length - 1;
+      const k = `${t.tf}_${n.name}`, edges = E[k], nb = edges.length - 1;
       const base = ctx === 'rule' ? mask(side, k, true) : null;
       const vals = Array.from({length: nb}, () => []), cnt = new Array(nb).fill(0);
-      for (let i = 0; i < N; i++) {
-        if (!inPeriod(i) || (base && !base[i])) continue;
-        const b = binOf(m.edges, F[k][i]); if (b < 0) continue;
+      for (let i = RA; i <= RB; i++) {
+        if (base && !base[i]) continue;
+        const b = binOf(edges, F[k][i]); if (b < 0) continue;
         cnt[b]++; const f = D.fwd[h][i]; if (f !== null) vals[b].push(f);
       }
       const e = state[side][k] || {};
       out += `<tr><td>${n.label}</td>` + Array.from({length: maxB}, (_, b) => {
         if (b >= nb) return '<td></td>';
-        const lo = m.edges[b], hi = m.edges[b + 1], av = mean(vals[b]);
+        const lo = edges[b], hi = edges[b + 1], av = mean(vals[b]);
         const win = vals[b].length ? (vals[b].filter(x => x > 0).length / vals[b].length * 100).toFixed(0) + '%' : 'n/a';
         const sel = (e.min != null || e.max != null) && (e.min == null || e.min <= lo) && (e.max == null || e.max >= hi) ? ' sel' : '';
         return `<td class="c${cnt[b] < 20 ? ' thin' : ''}${sel}" data-k="${k}" data-lo="${lo}" data-hi="${hi}" data-b="${b}" data-nb="${nb}" ` +
@@ -1099,7 +1435,7 @@ function heat() {
   $('heat').querySelectorAll('td.c').forEach(td => td.onclick = () => {
     const k = td.dataset.k, b = +td.dataset.b, nb = +td.dataset.nb;
     state[side][k] = {min: b === 0 ? null : Number(td.dataset.lo), max: b === nb - 1 ? null : Number(td.dataset.hi)};
-    fillGrid(); render();
+    render();
   });
 
   let ob = '<tr><th></th>' + D.tfs.map(t => `<th colspan="2" style="text-align:center">${t.name}</th>`).join('') + '</tr>' +
@@ -1109,7 +1445,7 @@ function heat() {
       const k = `${t.tf}_${n.name}`, base = ctx === 'rule' ? mask(side, k, true) : null;
       return [1, 0].map(val => {
         const v = []; let c = 0;
-        for (let i = 0; i < N; i++) { if (!inPeriod(i) || (base && !base[i]) || F[k][i] !== val) continue; c++; const f = D.fwd[h][i]; if (f !== null) v.push(f); }
+        for (let i = RA; i <= RB; i++) { if ((base && !base[i]) || F[k][i] !== val) continue; c++; const f = D.fwd[h][i]; if (f !== null) v.push(f); }
         const av = mean(v), e = state[side][k] || {}, sel = e.sel === val ? ' sel' : '';
         return `<td class="c${c < 20 ? ' thin' : ''}${sel}" data-k="${k}" data-v="${val}" style="background:${color(av, cap)};color:${txtColor(av, cap)}" ` +
           `title="${t.name} ${n.label}: ${val ? 'yes' : 'no'}\n${c} days · avg ${pct(av)}">${av === null ? '·' : pct(av, 1)}<span class="rng">${c} days</span></td>`;
@@ -1118,83 +1454,166 @@ function heat() {
   });
   $('heatBool').innerHTML = ob;
   $('heatBool').querySelectorAll('td.c').forEach(td => td.onclick = () => {
-    state[side][td.dataset.k] = {sel: Number(td.dataset.v)}; fillGrid(); render();
+    state[side][td.dataset.k] = {sel: Number(td.dataset.v)}; render();
   });
 }
 
-// ---------- suggestions ----------
-function sugBlock(s) {
-  const g = D.suggest[s], row = (lab, st) => `<tr><td>${lab}</td><td class="num">${st.n}</td><td class="num">${st.ep}</td>` +
-    `<td class="num"><span class="sw" style="background:${color(st.avg, D.heatCap)}"></span>${pct(st.avg)}</td><td class="num">${st.win === null ? 'n/a' : st.win.toFixed(0) + '%'}</td></tr>`;
-  if (!g.rule.length) return '<div class="note">No rule met the minimum signal-day and streak requirements.</div>';
-  const bTr = baselineRange(0, D.split), bTe = baselineRange(D.split, N);
-  return `<div class="rtext"><b>${g.text}</b></div><table><tr><th></th><th class="num">Days</th><th class="num">Streaks</th>` +
-    `<th class="num">Avg ${D.target}D</th><th class="num">% positive</th></tr>` + row('Training', g.train) + row('Test (unseen)', g.test) +
-    `<tr><td class="hint">All days, training</td><td></td><td></td><td class="num">${pct(bTr)}</td><td></td></tr>` +
-    `<tr><td class="hint">All days, test</td><td></td><td></td><td class="num">${pct(bTe)}</td><td></td></tr></table>` +
-    `<div style="margin-top:8px"><button data-load="${s}">Load into ${s} rule</button></div>`;
-}
-function baselineRange(a, b) { const v = []; for (let i = a; i < b; i++) { const f = D.fwd[String(D.target)][i]; if (f !== null) v.push(f); } return mean(v); }
-function singTable(s) {
-  const rows = D.suggest[s].singles;
-  $(s === 'buy' ? 'singBuy' : 'singSell').innerHTML = `<tr><th>Condition</th><th class="num">Train days</th><th class="num">Train avg</th>` +
-    `<th class="num">Test days</th><th class="num">Test avg</th><th class="num">Test % pos</th></tr>` +
-    (rows.length ? rows.map((r, j) => `<tr class="click" data-s="${s}" data-j="${j}"><td>${r.text}</td><td class="num">${r.train.n}</td>` +
-      `<td class="num">${pct(r.train.avg)}</td><td class="num">${r.test.n}</td>` +
-      `<td class="num"><span class="sw" style="background:${color(r.test.avg, D.heatCap)}"></span>${pct(r.test.avg)}</td>` +
-      `<td class="num">${r.test.win === null ? 'n/a' : r.test.win.toFixed(0) + '%'}</td></tr>`).join('')
-      : '<tr><td colspan="6" class="note">None met the minimums.</td></tr>');
+// ---------- suggestions (computed by the script on the latest optimizer years, per horizon) ----------
+function baselineRange(a, b) { const v = []; for (let i = a; i < b; i++) { const f = D.fwd[H][i]; if (f !== null) v.push(f); } return mean(v); }
+function sugg() {
+  const S = D.suggest[H], hc = capFor(H, D.heatCap);
+  $('sugPill').textContent = `for the ${hName(H)} horizon`;
+  $('sugNote').innerHTML = `Recomputed every time the script runs, from the latest ${D.optYears} years only: picked on
+    ${fmtDate(D.optStartDate)} to ${fmtDate(D.dates[D.split - 1])} (${D.opt.trainPct}%), then checked on ${fmtDate(D.splitDate)} to
+    ${fmtDate(D.dates[N - 1])}, days the search never saw. So running it for another ticker gives that ticker's own suggestions.
+    Search: single thresholds at every 5th percentile of each indicator plus the yes/no fields, combined greedily up to ${D.opt.maxConds}
+    conditions; each rule had to fire on ${D.opt.minDays}+ days in ${D.opt.minEp}+ separate streaks. Rule 2 is the best rule that uses
+    <i>different</i> indicators from rule 1, so it's a genuinely separate strategy. Change the forward-return horizon above to see the
+    suggestions for 1 week up to ~3 months. Trust the test columns, not training. Raw-dollar MACD fields are left out.`;
+  const bTr = baselineRange(D.optStart, D.split), bTe = baselineRange(D.split, N);
+  SLOTS.forEach(s => {
+    const g = S[s.id], row = (lab, st) => `<tr><td>${lab}</td><td class="num">${st.n}</td><td class="num">${st.ep}</td>` +
+      `<td class="num"><span class="sw" style="background:${color(st.avg, hc)}"></span>${pct(st.avg)}</td><td class="num">${st.win === null ? 'n/a' : st.win.toFixed(0) + '%'}</td></tr>`;
+    const kindWord = s.dir > 0 ? 'buy' : 'sell', twin = s.dir > 0 ? BUYS : SELLS;
+    const head = `<h2 style="font-size:14px;color:${STY[s.id].col}">${STY[s.id].mark} Suggested ${kindWord} rule ${s.id.endsWith('1') ? '1 (best)' : '2 (alternative, different indicators)'}</h2>`;
+    if (!g.rule.length) { $('sug_' + s.id).innerHTML = head + '<div class="note">No rule met the minimum signal-day and streak requirements.</div>'; return; }
+    $('sug_' + s.id).innerHTML = head + `<div class="hint" style="margin-bottom:6px"><b>${esc(g.text)}</b></div><table><tr><th></th><th class="num">Days</th><th class="num">Streaks</th>` +
+      `<th class="num">Avg ${H}D</th><th class="num">% positive</th></tr>` + row('Training', g.train) + row('Test (unseen)', g.test) +
+      `<tr><td class="hint">All days, training</td><td></td><td></td><td class="num">${pct(bTr)}</td><td></td></tr>` +
+      `<tr><td class="hint">All days, test</td><td></td><td></td><td class="num">${pct(bTe)}</td><td></td></tr></table>` +
+      `<div class="row" style="margin-top:8px">` + twin.map(t => `<button class="sm" data-load="${s.id}" data-into="${t}">Load into ${SL[t].label}</button>`).join('') + '</div>';
+  });
+  document.querySelectorAll('[data-load]').forEach(b => b.onclick = () => {
+    side = b.dataset.into; state[side] = condsToState(D.suggest[H][b.dataset.load].rule); drawTabs(); render();
+    window.scrollTo({top: 0, behavior: 'smooth'}); });
+  [['buy1', 'singBuy'], ['sell1', 'singSell']].forEach(([s, id]) => {
+    const rows = S[s].singles;
+    $(id).innerHTML = `<tr><th>Condition</th><th class="num">Train days</th><th class="num">Train avg</th>` +
+      `<th class="num">Test days</th><th class="num">Test avg</th><th class="num">Test % pos</th></tr>` +
+      (rows.length ? rows.map((r, j) => `<tr class="click" data-s="${s}" data-j="${j}"><td>${esc(r.text)}</td><td class="num">${r.train.n}</td>` +
+        `<td class="num">${pct(r.train.avg)}</td><td class="num">${r.test.n}</td>` +
+        `<td class="num"><span class="sw" style="background:${color(r.test.avg, hc)}"></span>${pct(r.test.avg)}</td>` +
+        `<td class="num">${r.test.win === null ? 'n/a' : r.test.win.toFixed(0) + '%'}</td></tr>`).join('')
+        : '<tr><td colspan="6" class="note">None met the minimums.</td></tr>');
+  });
+  document.querySelectorAll('#singBuy tr.click, #singSell tr.click').forEach(tr => tr.onclick = () => {
+    const isBuy = tr.dataset.s === 'buy1', target = isBuy ? (BUYS.includes(side) ? side : 'buy1') : (SELLS.includes(side) ? side : 'sell1');
+    side = target; addCond(side, D.suggest[H][tr.dataset.s].singles[+tr.dataset.j].cond); drawTabs(); render(); });
 }
 function addCond(s, c) {
   const e = state[s][c.k] || (state[s][c.k] = {});
   if (c.op === '>=') e.min = c.v; else if (c.op === '<=') e.max = c.v; else e.sel = c.v;
 }
 
-// ---------- signal list ----------
-function hits(st) {
-  const rows = st.idx.slice(-40).reverse();
-  $('hitsTitle').textContent = `Recent ${side} signal days (${st.n} in period, newest first, last 40 shown)`;
-  const keys = ruleKeys(side);
-  $('hits').innerHTML = `<tr><th>Date</th><th class="num">Close</th>` + D.fwdDays.map(n => `<th class="num">${n}D fwd</th>`).join('') +
-    keys.map(k => `<th class="num">${MK[k].tf} ${MK[k].name}</th>`).join('') + '</tr>' +
-    (rows.length ? rows.map(i => `<tr><td>${D.dates[i]}</td><td class="num">$${D.close[i].toFixed(2)}</td>` +
-      D.fwdDays.map(n => { const v = D.fwd[String(n)][i];
-        return `<td class="num" style="background:${color(v, D.cap)};color:${txtColor(v, D.cap)}">${v === null ? 'pending' : pct(v)}</td>`; }).join('') +
-      keys.map(k => `<td class="num">${fmtVal(k, F[k][i])}</td>`).join('') + '</tr>').join('')
-      : `<tr><td colspan="9" class="note">The ${side} rule didn't fire in this period.</td></tr>`);
+// ---------- all signal days, every rule ----------
+let hitOn = null, hitFirst = false;
+let lastM = null;
+function hitControls() {
+  if (!hitOn) hitOn = Object.fromEntries(SLOTS.map(s => [s.id, true]));
+  $('hitSlots').innerHTML = '<span class="hint">Show:</span>' + SLOTS.map(s => `<label class="ctl"><input type="checkbox" data-hs="${s.id}" ${hitOn[s.id] ? 'checked' : ''}>` +
+    `${chip(s.id)}${s.label}${ruleKeys(s.id).length ? '' : ' <span class="hint">(empty)</span>'}</label>`).join('') +
+    `<label class="ctl" style="margin-left:12px"><input type="checkbox" id="hitFirst" ${hitFirst ? 'checked' : ''}> first day of each streak only</label>`;
+  $('hitSlots').querySelectorAll('input[data-hs]').forEach(el => el.onchange = () => { hitOn[el.dataset.hs] = el.checked; hits(lastM); });
+  $('hitFirst').onchange = () => { hitFirst = $('hitFirst').checked; hits(lastM); };
+}
+function hits(M) {
+  lastM = M;
+  const on = SLOTS.map(s => s.id).filter(id => hitOn[id] && ruleKeys(id).length);
+  const keys = [...new Set(on.flatMap(id => ruleKeys(id)))];
+  keys.sort((a, b) => D.meta.findIndex(m => m.k === a) - D.meta.findIndex(m => m.k === b));
+  const fires = (id, i) => M[id][i] && (!hitFirst || i === 0 || !M[id][i - 1]);
+  const rows = []; for (let i = RB; i >= RA; i--) if (on.some(id => fires(id, i))) rows.push(i);
+  $('hitsTitle').textContent = `Signal days for every rule (${rows.length.toLocaleString()} ${hitFirst ? 'streak starts' : 'days'} in the range, newest first)`;
+  $('hits').innerHTML = `<tr><th>Date</th><th>Signals</th><th class="num">Close</th>` +
+    D.fwdDays.map(n => `<th class="num">${n}D fwd</th>`).join('') +
+    keys.map(k => `<th class="num" title="${MK[k].tfName} ${MK[k].label}">${MK[k].tf} ${MK[k].name}<br>${on.filter(id => ruleKeys(id).includes(k)).map(id => `<span class="hint">${STY[id].short}</span>`).join(' ')}</th>`).join('') + '</tr>' +
+    (rows.length ? rows.slice(0, 150).map(i => {
+      const fired = on.filter(id => fires(id, i));
+      return `<tr><td>${D.dates[i]}</td><td>${fired.map(chip).join('')}</td><td class="num">$${D.close[i].toFixed(2)}</td>` +
+        D.fwdDays.map(n => { const v = D.fwd[String(n)][i], cp = capFor(n, D.cap);
+          return `<td class="num" style="background:${color(v, cp)};color:${txtColor(v, cp)}">${v === null ? 'pending' : pct(v)}</td>`; }).join('') +
+        keys.map(k => `<td class="num${fired.some(id => ruleKeys(id).includes(k)) ? ' b' : ''}">${fmtVal(k, F[k][i])}</td>`).join('') + '</tr>';
+    }).join('') : `<tr><td colspan="${3 + D.fwdDays.length + keys.length}" class="note">No selected rule fired in this range.</td></tr>`);
 }
 
 // ---------- render ----------
 function render() {
-  const mb = mask('buy'), ms = mask('sell');
-  const p = $('period');
-  $('periodPill').textContent = p.options[p.selectedIndex].text;
-  const sb = tiles('buy', mb), ss = tiles('sell', ms);
-  today(mb, ms); chart(sb, ss); heat(); hits(side === 'buy' ? sb : ss); fillGrid();
-  $('ruleText').textContent = `Editing the ${side} rule` + (ruleKeys(side).length ? '' : ' (empty)');
+  const M = Object.fromEntries(SLOTS.map(s => [s.id, mask(s.id)]));
+  const ST = Object.fromEntries(SLOTS.map(s => [s.id, statsOf(M[s.id], H)]));
+  fillGrid(); results(ST); today(M); chart(ST, M); trips(M); heat(); sugg(); hitControls(); hits(M);
+  autosave();
 }
 function postHeight() {
   if (window.parent !== window) window.parent.postMessage({type: 'scanner-height', h: document.documentElement.scrollHeight}, '*');
 }
 
 (function init() {
-  $('horizon').innerHTML = D.fwdDays.map(n => `<option value="${n}" ${String(n) === H ? 'selected' : ''}>${n} days</option>`).join('');
-  $('optMax').textContent = D.opt.maxConds; $('optDays').textContent = D.opt.minDays; $('optEp').textContent = D.opt.minEp;
-  state.buy = condsToState(D.rules.buy.conds); state.sell = condsToState(D.rules.sell.conds);
-  $('sugBuy').innerHTML = sugBlock('buy'); $('sugSell').innerHTML = sugBlock('sell');
-  singTable('buy'); singTable('sell');
-  document.querySelectorAll('[data-load]').forEach(b => b.onclick = () => {
-    side = b.dataset.load; state[side] = condsToState(D.suggest[side].rule); drawGrid(); render();
-    window.scrollTo({top: 0, behavior: 'smooth'}); });
-  document.querySelectorAll('#singBuy tr.click, #singSell tr.click').forEach(tr => tr.onclick = () => {
-    side = tr.dataset.s; addCond(side, D.suggest[side].singles[+tr.dataset.j].cond); drawGrid(); render(); });
-  document.querySelectorAll('.tab').forEach(b => b.onclick = () => { side = b.dataset.side; drawGrid(); render(); });
-  $('resetBtn').onclick = () => { state[side] = condsToState(D.rules[side].conds); fillGrid(); render(); };
-  $('suggestBtn').onclick = () => { state[side] = condsToState(D.suggest[side].rule); fillGrid(); render(); };
-  $('clearBtn').onclick = () => { state[side] = {}; fillGrid(); render(); };
+  $('horizon').innerHTML = D.fwdDays.map(n => `<option value="${n}">${hName(n)}</option>`).join('');
+  $('from').min = $('to').min = D.dates[0]; $('from').max = $('to').max = D.dates[N - 1];
+  periodOptions();
+  SLOTS.forEach(s => state[s.id] = condsToState(D.rules[s.id].conds));
+  const pairOpts = PAIRS.map(p => `<option value="${p.id}">${p.label}</option>`).join('');
+  $('tripPair').innerHTML = $('chartPair').innerHTML = pairOpts;
+
+  const saved = sget(KEY_CUR);
+  if (saved && saved.rules) {
+    SLOTS.forEach(s => { if (saved.rules[s.id]) state[s.id] = fromPy(saved.rules[s.id]); });
+    if (saved.H && D.fwdDays.map(String).includes(String(saved.H))) H = String(saved.H);
+    if (saved.period && [...$('period').options].some(o => o.value === saved.period)) $('period').value = saved.period;
+    if (saved.period === 'custom') { $('from').value = saved.from || ''; $('to').value = saved.to || ''; }
+    if (saved.side && SL[saved.side]) side = saved.side;
+  }
+  $('horizon').value = H;
+  applyPeriod(); drawTabs(); drawGrid(); drawLib(); baseNote();
+
+  $('resetBtn').onclick = () => { state[side] = condsToState(D.rules[side].conds); render(); };
+  $('suggestBtn').onclick = () => { state[side] = condsToState(D.suggest[H][side].rule); render(); };
+  $('clearBtn').onclick = () => { state[side] = {}; render(); };
   $('horizon').onchange = () => { H = $('horizon').value; render(); };
-  ['period', 'heatCtx', 'logY'].forEach(id => $(id).addEventListener('change', render));
-  drawGrid(); render();
+  $('period').onchange = () => { applyPeriod(); render(); };
+  ['from', 'to'].forEach(id => $(id).addEventListener('change', () => { $('period').value = 'custom'; applyPeriod(); render(); }));
+  ['heatCtx', 'logY', 'showTrips', 'chartPair'].forEach(id => $(id).addEventListener('change', render));
+  $('tripPair').onchange = () => { $('chartPair').value = $('tripPair').value; render(); };
+
+  $('saveBtn').onclick = () => {
+    if (!ruleKeys(side).length) { note('This rule is empty. Set some conditions first.'); return; }
+    const name = $('saveName').value.trim() || `${SL[side].label}: ${ruleDesc(side)}`.slice(0, 80);
+    const kind = SL[side].dir > 0 ? 'buy' : 'sell', j = library.findIndex(r => r.name === name && r.kind === kind);
+    const rec = {name, kind, rule: toPy(side), ticker: D.ticker, saved: new Date().toISOString().slice(0, 10)};
+    if (j >= 0) library[j] = rec; else library.push(rec);
+    const ok = sset(KEY_LIB, library); drawLib(); $('libSel').value = String(j >= 0 ? j : library.length - 1); $('saveName').value = '';
+    note(ok ? `<span class="ok-msg">Saved “${esc(name)}”.</span> Load it into any slot, for any ticker. Use Export to keep a file copy.`
+      : `Saved for this page visit only (browser storage is blocked). Use <b>Export rules</b> to keep it.`);
+  };
+  $('libLoad').onclick = () => { const r = library[+$('libSel').value]; if (!r) return;
+    state[side] = fromPy(r.rule); render(); note(`<span class="ok-msg">Loaded “${esc(r.name)}” into ${SL[side].label}.</span>`); };
+  $('libDel').onclick = () => { const j = +$('libSel').value, r = library[j]; if (!r || !confirm(`Delete saved rule “${r.name}”?`)) return;
+    library.splice(j, 1); sset(KEY_LIB, library); drawLib(); baseNote(); };
+  $('exportBtn').onclick = () => {
+    download(`mtf_signal_rules_${D.ticker}.json`, JSON.stringify({ticker: D.ticker, saved: new Date().toISOString(), horizon: Number(H),
+      rules: Object.fromEntries(SLOTS.map(s => [s.id, toPy(s.id)])), library}, null, 2));
+    note(`<span class="ok-msg">Downloaded mtf_signal_rules_${esc(D.ticker)}.json.</span> Put it next to mtf_signal_scanner.py and the next run
+      uses these four rules for alerts and as the report's starting rules (an empty slot = no alerts for it).`);
+  };
+  $('importBtn').onclick = () => $('importFile').click();
+  $('importFile').onchange = async () => {
+    const f = $('importFile').files[0]; if (!f) return;
+    try {
+      const o = JSON.parse(await f.text());
+      SLOTS.forEach(s => { if (o.rules && o.rules[s.id]) state[s.id] = fromPy(o.rules[s.id]); });
+      (o.library || []).forEach(r => { if (!library.some(x => x.name === r.name && x.kind === r.kind)) library.push(r); });
+      sset(KEY_LIB, library); drawLib(); render();
+      note(`<span class="ok-msg">Imported ${esc(f.name)}.</span>`);
+    } catch (e) { note(`Couldn't read ${esc(f.name)}: ${esc(e.message)}`); }
+    $('importFile').value = '';
+  };
+  $('copyPy').onclick = async () => {
+    const t = pyText();
+    try { await navigator.clipboard.writeText(t); note('<span class="ok-msg">Copied.</span> Paste over BUY_RULE / SELL_RULE / BUY_RULE_2 / SELL_RULE_2 in the script.'); }
+    catch (e) { note(`<pre style="margin:4px 0;font-size:12px">${esc(t)}</pre>`); }
+  };
+
+  render();
   window.addEventListener('load', postHeight);
   if (window.ResizeObserver) new ResizeObserver(postHeight).observe(document.body);
 })();
@@ -1208,19 +1627,23 @@ function postHeight() {
 # ============================================================
 
 def main():
+    global TICKER
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--alert", action="store_true", help="check the latest close and email buy/sell alerts (no report)")
+    ap.add_argument("--ticker", help=f"symbol to scan (default {TICKER}, or the SIGNAL_TICKER env variable)")
+    ap.add_argument("--alert", action="store_true", help="check the latest close and email alerts for any rule that fires (no report)")
     ap.add_argument("--force", action="store_true", help="with --alert: send even if the latest bar isn't from today")
     args = ap.parse_args()
+    if args.ticker:
+        TICKER = args.ticker.strip().upper()
 
     print(f"Downloading {TICKER} daily history and replaying the scanner...")
-    win, train, test, split_date, suggest, rules = prepare()
-    print(f"Window {win.index.min():%Y-%m-%d} to {win.index.max():%Y-%m-%d} ({len(win):,} days); "
-          f"training before {split_date:%Y-%m-%d}, test after.")
-    for side in ("buy", "sell"):
-        g = suggest[side]
+    win, opt_start, split_date, suggest, rules = prepare()
+    print(f"Window {win.index.min():%Y-%m-%d} to {win.index.max():%Y-%m-%d} ({len(win):,} days). Optimizer uses "
+          f"{opt_start:%Y-%m-%d} onward: training before {split_date:%Y-%m-%d}, test after.")
+    for slot, lab, *_ in SLOTS:
+        g = suggest[TARGET_FWD_DAYS][slot]
         tr, te = g["train"], g["test"]
-        print(f"Suggested {side.upper()}: {g['text']}")
+        print(f"Suggested {lab.upper()} ({TARGET_FWD_DAYS}D): {g['text']}")
         if tr["avg"] is not None:
             te_avg = "n/a" if te["avg"] is None else f"{te['avg']:+.2f}%"
             print(f"   train {tr['n']} days avg {tr['avg']:+.2f}% | test {te['n']} days avg {te_avg}")
@@ -1230,13 +1653,13 @@ def main():
         return
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    cols = ["Close", *[f"Fwd_{n}D%" for n in FORWARD_DAYS], "Buy_Signal", "Sell_Signal", "Period", *ALL_KEYS]
+    cols = ["Close", *[f"Fwd_{n}D%" for n in FORWARD_DAYS], *[SLOT_COL[s] for s, *_ in SLOTS], "Period", *ALL_KEYS]
     win[cols].round(4).to_csv(CSV_OUT, index_label="Date")
-    build_report(win, split_date, suggest, rules)
+    build_report(win, opt_start, split_date, suggest, rules)
     st = latest_status(win, rules)
-    for side in ("buy", "sell"):
-        print(f"Latest close {win.index[-1]:%Y-%m-%d}: {side.upper()} rule "
-              f"{'FIRES' if st[side]['fires'] else 'no signal'} ({rules[side]['source']}: {rules[side]['text']})")
+    for slot, lab, *_ in SLOTS:
+        print(f"Latest close {win.index[-1]:%Y-%m-%d}: {lab.upper()} rule "
+              f"{'FIRES' if st[slot]['fires'] else 'no signal'} ({rules[slot]['source']}: {rules[slot]['text']})")
     print(f"Report: {HTML_OUT}\nCSV:    {CSV_OUT}")
 
 

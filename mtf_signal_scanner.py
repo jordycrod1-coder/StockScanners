@@ -3,8 +3,9 @@ Multi-Timeframe Buy/Sell Signal Scanner + Backtest
 ==================================================
 
 Uses the same indicators as Ticker_Indicator_Graph_DWM.ipynb (MACD 12/26/9, RSI 14,
-Stochastic 14/3/3, MFI 14, CMF 20) on the Daily, Weekly and Monthly timeframes, and
-answers two questions for one ticker (default TSLA):
+Stochastic 14/3/3, MFI 14, CMF 20) plus Relative Volume, Price vs 20/50 SMA,
+Relative Strength vs SPY, RS Acceleration and Price Momentum (ROC) on the Daily,
+Weekly and Monthly timeframes, and answers two questions for one ticker (default TSLA):
 
   BUY  - which indicator values were followed by the HIGHEST 10-day forward return?
   SELL - which indicator values were followed by the LOWEST 10-day forward return
@@ -16,6 +17,25 @@ Every trading day in the window is replayed as if the scanner ran after that day
 close. Weekly and Monthly values are read the way the notebook shows them live:
 the current week/month is a partial bar (week-to-date / month-to-date), so no
 future data leaks in. Forward return = close N trading days later vs. that close.
+
+Added indicators (every one is computed on D, W and M, is a filter, and is used by
+the optimizer). Lookbacks are in bars of that timeframe (20 bars = 20 days on
+Daily, 20 weeks on Weekly, 20 months on Monthly), like the notebook's RSI 14 etc.:
+  RVOL        relative volume = average daily volume inside the bar / average daily
+              volume of the previous RVOL_PERIOD bars. 1.0 = normal, 2.0 = double.
+              (Week/month-to-date bars are pace-adjusted, so Monday isn't "low".)
+  SMA5_Pct, SMA10_Pct, SMA20_Pct, SMA50_Pct
+              % the close is above (+) / below (-) its 5/10/20/50-bar simple moving
+              average, one filter each; plus yes/no "close above" for each SMA and
+              "stacked bullish" (5 > 10 > 20 > 50) / "stacked bearish" (5 < 10 < 20 < 50)
+  RS_SPY      relative strength vs BENCHMARK: % change of the ratio close / SPY close
+              over RS_PERIOD bars. +5 = beat SPY by ~5% over that stretch.
+  RS_Accel    RS acceleration = RS_SPY now minus RS_SPY RS_ACCEL_PERIOD bars ago.
+              Positive = relative strength is improving.
+  ROC         price momentum, rate of change = % change of the close over ROC_PERIOD bars
+
+Hover over any buy/sell marker on the price chart to see every indicator's Daily,
+Weekly and Monthly value on that day (also shown in the panel under the chart).
 
 Two ways to find good values:
   1. Interactive report (HTML): every indicator on every timeframe is a filter for
@@ -104,7 +124,10 @@ DATA_PERIOD = "max"
 #   }
 #
 # Field names: RSI, StochK, StochD, MFI, CMF, MACD, Signal, Hist, MACD_Pct, Hist_Pct,
-#              MACD_Bull, MACD_Pos, Hist_Rising, Stoch_Bull, Flow_Bull, Candle_Up
+#              RVOL, SMA5_Pct, SMA10_Pct, SMA20_Pct, SMA50_Pct, RS_SPY, RS_Accel, ROC,
+#              MACD_Bull, MACD_Pos, Hist_Rising, Stoch_Bull, Flow_Bull, Candle_Up,
+#              Above_SMA5, Above_SMA10, Above_SMA20, Above_SMA50, SMA_Stack_Bull, SMA_Stack_Bear
+#   e.g. BUY_RULE = {"D_RVOL": (1.5, None), "W_RS_SPY": (0, None), "D_Above_SMA50": True}
 BUY_RULE = "auto"
 SELL_RULE = "auto"
 # Second strategy. "auto" = the optimizer's alternative rule, built from different
@@ -118,6 +141,18 @@ RULES_FILE = os.environ.get("SIGNAL_RULES_FILE", "mtf_signal_rules_{ticker}.json
 
 # "every" = email every day the rule is true; "new" = only the first day of a streak
 ALERT_MODE = "every"
+
+# ============================================================
+# ADDED INDICATOR SETTINGS (lookbacks in bars of each timeframe)
+# ============================================================
+
+BENCHMARK = os.environ.get("SIGNAL_BENCHMARK", "SPY")   # relative strength is measured against this
+RVOL_PERIOD = 20             # relative volume: compare with the average of the previous N bars
+RS_PERIOD = 20               # RS vs SPY: change of the price ratio over N bars
+RS_ACCEL_PERIOD = 5          # RS acceleration: RS now minus RS this many bars ago
+ROC_PERIOD = 12              # price momentum: % change over N bars (12 = the classic ROC setting)
+SMA_PERIODS = [5, 10, 20, 50] # "Price vs SMA": one % field + one yes/no field per SMA
+                             # (field names follow the numbers: SMA5_Pct, Above_SMA5, ...)
 
 # ============================================================
 # BACKTEST / OPTIMIZER SETTINGS
@@ -191,6 +226,11 @@ NUM_FIELDS = [   # name, label, step for the filter input, decimals kept
     ("Hist", "MACD histogram ($)", 0.1, 3),
     ("MACD_Pct", "MACD, % of price", 0.1, 3),
     ("Hist_Pct", "Histogram, % of price", 0.1, 3),
+    ("RVOL", f"Relative volume (x avg of prior {RVOL_PERIOD})", 0.1, 2),
+    *[(f"SMA{p}_Pct", f"Price vs {p} SMA, %", 1, 2) for p in SMA_PERIODS],
+    ("RS_SPY", f"RS vs {BENCHMARK}, {RS_PERIOD}-bar %", 1, 2),
+    ("RS_Accel", f"RS acceleration ({RS_ACCEL_PERIOD}-bar change)", 1, 2),
+    ("ROC", f"Price momentum, ROC {ROC_PERIOD} %", 1, 2),
 ]
 BOOL_FIELDS = [
     ("MACD_Bull", "MACD above signal"),
@@ -199,13 +239,30 @@ BOOL_FIELDS = [
     ("Stoch_Bull", "%K above %D"),
     ("Flow_Bull", "MFI > 50 and CMF > 0"),
     ("Candle_Up", "Candle up (close > open)"),
+    *[(f"Above_SMA{p}", f"Close above {p} SMA") for p in SMA_PERIODS],
+    ("SMA_Stack_Bull", "SMAs stacked bullish (" + " > ".join(map(str, SMA_PERIODS)) + ")"),
+    ("SMA_Stack_Bear", "SMAs stacked bearish (" + " < ".join(map(str, SMA_PERIODS)) + ")"),
 ]
+# Short names for the chart tooltip
+SHORT = {"RSI": "RSI 14", "StochK": "Stoch %K", "StochD": "Stoch %D", "MFI": "MFI 14", "CMF": "CMF 20",
+         "MACD": "MACD $", "Signal": "MACD sig $", "Hist": "MACD hist $", "MACD_Pct": "MACD %px",
+         "Hist_Pct": "Hist %px", "RVOL": "Rel volume", "RS_SPY": f"RS vs {BENCHMARK}"[:12], "RS_Accel": "RS accel",
+         "ROC": f"ROC {ROC_PERIOD} %", "MACD_Bull": "MACD>sig", "MACD_Pos": "MACD>0",
+         "Hist_Rising": "Hist rising", "Stoch_Bull": "%K>%D", "Flow_Bull": "Flow bull", "Candle_Up": "Candle up",
+         "SMA_Stack_Bull": "SMA stack up", "SMA_Stack_Bear": "SMA stack dn",
+         **{f"SMA{p}_Pct": f"vs SMA{p} %" for p in SMA_PERIODS}, **{f"Above_SMA{p}": f">SMA{p}" for p in SMA_PERIODS}}
 # The optimizer skips raw-dollar MACD fields: $ values from a $20 stock and a $400 stock
 # aren't comparable, so it uses the % of price versions instead.
-OPT_NUM_FIELDS = ["RSI", "StochK", "StochD", "MFI", "CMF", "MACD_Pct", "Hist_Pct"]
+OPT_NUM_FIELDS = ["RSI", "StochK", "StochD", "MFI", "CMF", "MACD_Pct", "Hist_Pct",
+                  "RVOL", *[f"SMA{p}_Pct" for p in SMA_PERIODS], "RS_SPY", "RS_Accel", "ROC"]
+# The backtest window starts once these are warmed up on all three timeframes. The added
+# indicators can need more history (a 50-month SMA needs 4+ years), so they may be blank
+# (n/a) early in the window instead of shortening it; a blank value never passes a filter.
+CORE_FIELDS = ["RSI", "StochK", "StochD", "MFI", "CMF", "MACD", "Signal", "Hist", "MACD_Pct", "Hist_Pct"]
 
 NUM_KEYS = [f"{tf}_{n}" for tf, _, _ in TIMEFRAMES for n, *_ in NUM_FIELDS]
 BOOL_KEYS = [f"{tf}_{n}" for tf, _, _ in TIMEFRAMES for n, _ in BOOL_FIELDS]
+CORE_KEYS = [f"{tf}_{n}" for tf, _, _ in TIMEFRAMES for n in CORE_FIELDS]
 ALL_KEYS = NUM_KEYS + BOOL_KEYS
 LABEL = {n: lab for n, lab, *_ in NUM_FIELDS} | {n: lab for n, lab in BOOL_FIELDS}
 TF_NAME = {tf: name for tf, name, _ in TIMEFRAMES}
@@ -273,6 +330,24 @@ def compute_indicators(df):
     return df
 
 
+def added_indicators(df):
+    """Relative volume, SMAs, RS vs benchmark, RS acceleration, ROC on complete bars.
+
+    Needs Close, Volume, Bench (benchmark close) and NDays (trading days in the bar).
+    """
+    out = pd.DataFrame(index=df.index)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        adv = df["Volume"] / df["NDays"]                       # average daily volume inside each bar
+        out["RVOL"] = (adv / adv.shift(1).rolling(RVOL_PERIOD).mean()).replace([np.inf, -np.inf], np.nan)
+        for p in SMA_PERIODS:
+            out[f"SMA{p}"] = df["Close"].rolling(p).mean()
+        out["ROC"] = (df["Close"] / df["Close"].shift(ROC_PERIOD) - 1) * 100
+        ratio = df["Close"] / df["Bench"]
+        out["RS"] = (ratio / ratio.shift(RS_PERIOD) - 1) * 100
+        out["RS_Accel"] = out["RS"] - out["RS"].shift(RS_ACCEL_PERIOD)
+    return out
+
+
 # ============================================================
 # WEEKLY / MONTHLY AS SEEN LIVE (partial current bar, no look-ahead)
 # ============================================================
@@ -292,8 +367,10 @@ def partial_bar_indicators(daily: pd.DataFrame, freq: str) -> pd.DataFrame:
     codes, uniq = pd.factorize(per)          # dates are sorted -> codes are bar positions
     k = codes
     bars = daily.groupby(codes).agg(Open=("Open", "first"), High=("High", "max"), Low=("Low", "min"),
-                                    Close=("Close", "last"), Volume=("Volume", "sum"))
+                                    Close=("Close", "last"), Volume=("Volume", "sum"),
+                                    Bench=("Bench", "last"), NDays=("Close", "size"))
     ind = compute_indicators(bars)
+    add = added_indicators(bars)
 
     def prev(s, n=1):
         a = np.asarray(s, dtype=float)
@@ -309,6 +386,8 @@ def partial_bar_indicators(daily: pd.DataFrame, freq: str) -> pd.DataFrame:
     L = grp["Low"].cummin().values
     C = daily["Close"].values.astype(float)
     V = grp["Volume"].cumsum().values.astype(float)
+    ND = (grp.cumcount() + 1).values.astype(float)     # trading days so far in the current bar
+    B = daily["Bench"].values.astype(float)
     first = k == 0
 
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -360,9 +439,25 @@ def partial_bar_indicators(daily: pd.DataFrame, freq: str) -> pd.DataFrame:
         mfm_p = np.where(rng_p == 0, 0.0, ((C - L) - (H - C)) / np.where(rng_p == 0, np.nan, rng_p))
         cmf_p = (prev(mfv.rolling(19).sum()) + mfm_p * V) / (prev(bars["Volume"].rolling(19).sum()) + V)
 
+        # Relative volume, pace-adjusted: avg daily volume so far this bar vs the previous bars' average
+        adv = bars["Volume"] / bars["NDays"]
+        rvol_p = (V / ND) / prev(adv.rolling(RVOL_PERIOD).mean())
+        rvol_p = np.where(np.isfinite(rvol_p), rvol_p, np.nan)
+
+        # SMAs including today's partial close
+        smas = {f"SMA{p}": (prev(bars["Close"].rolling(p - 1).sum()) + C) / p if p > 1 else C
+                for p in SMA_PERIODS}
+
+        # Momentum and relative strength vs benchmark
+        roc_p = (C / prev(bars["Close"], ROC_PERIOD) - 1) * 100
+        ratio = bars["Close"] / bars["Bench"]
+        rs_p = (C / B / prev(ratio, RS_PERIOD) - 1) * 100
+        rs_acc_p = rs_p - prev(add["RS"], RS_ACCEL_PERIOD)
+
     return pd.DataFrame({
         "Open": O, "Close": C, "MACD": macd, "Signal": sig, "RSI": rsi_p, "%K": k_p, "%D": d_stoch,
         "MFI": mfi_p, "CMF": cmf_p, "Hist_Prev": prev(ind["MACD"] - ind["Signal"]),
+        "RVOL": rvol_p, **smas, "ROC": roc_p, "RS": rs_p, "RS_Accel": rs_acc_p,
     }, index=daily.index)
 
 
@@ -372,13 +467,25 @@ def timeframe_fields(tf: str, x: pd.DataFrame) -> pd.DataFrame:
     hist_prev = x["Hist_Prev"] if "Hist_Prev" in x else hist.shift(1)
     known = x[["MACD", "Signal", "RSI", "%K", "%D", "MFI", "CMF"]].notna().all(axis=1)
 
-    def flag(cond):
-        return cond.astype(float).where(known)
+    def flag(cond, ok=known):
+        return cond.astype(float).where(ok)
+
+    sma = {p: x[f"SMA{p}"] for p in SMA_PERIODS}
+    sma_known = pd.concat(sma.values(), axis=1).notna().all(axis=1)
+    per = sorted(SMA_PERIODS)
+    stack_bull = pd.Series(True, index=x.index)
+    stack_bear = pd.Series(True, index=x.index)
+    for a, b in zip(per[:-1], per[1:]):
+        stack_bull &= sma[a] > sma[b]
+        stack_bear &= sma[a] < sma[b]
 
     out = pd.DataFrame({
         "RSI": x["RSI"], "StochK": x["%K"], "StochD": x["%D"], "MFI": x["MFI"], "CMF": x["CMF"],
         "MACD": x["MACD"], "Signal": x["Signal"], "Hist": hist,
         "MACD_Pct": x["MACD"] / x["Close"] * 100, "Hist_Pct": hist / x["Close"] * 100,
+        "RVOL": x["RVOL"],
+        **{f"SMA{p}_Pct": (x["Close"] / sma[p] - 1) * 100 for p in SMA_PERIODS},
+        "RS_SPY": x["RS"], "RS_Accel": x["RS_Accel"], "ROC": x["ROC"],
         # the notebook colors a histogram bar green when it is >= the previous bar
         "MACD_Bull": flag(x["MACD"] > x["Signal"]),
         "MACD_Pos": flag(x["MACD"] > 0),
@@ -386,6 +493,9 @@ def timeframe_fields(tf: str, x: pd.DataFrame) -> pd.DataFrame:
         "Stoch_Bull": flag(x["%K"] > x["%D"]),
         "Flow_Bull": flag((x["MFI"] > 50) & (x["CMF"] > 0)),
         "Candle_Up": flag(x["Close"] > x["Open"]),
+        **{f"Above_SMA{p}": flag(x["Close"] > sma[p], sma[p].notna()) for p in SMA_PERIODS},
+        "SMA_Stack_Bull": flag(stack_bull, sma_known),
+        "SMA_Stack_Bear": flag(stack_bear, sma_known),
     }, index=x.index)
     return out.add_prefix(f"{tf}_")
 
@@ -393,7 +503,11 @@ def timeframe_fields(tf: str, x: pd.DataFrame) -> pd.DataFrame:
 def build_history(daily: pd.DataFrame) -> pd.DataFrame:
     parts = []
     for tf, _, freq in TIMEFRAMES:
-        x = compute_indicators(daily) if tf == "D" else partial_bar_indicators(daily, freq)
+        if tf == "D":
+            x = compute_indicators(daily)
+            x = x.join(added_indicators(daily.assign(NDays=1.0)))
+        else:
+            x = partial_bar_indicators(daily, freq)
         parts.append(timeframe_fields(tf, x))
     hist = pd.concat(parts, axis=1)[ALL_KEYS]
     hist.insert(0, "Close", daily["Close"])
@@ -471,8 +585,10 @@ def stats(mask, y):
 def nice(name, v):
     if name in ("RSI", "StochK", "StochD", "MFI"):
         return float(round(v))
-    if name == "CMF":
+    if name in ("CMF", "RVOL"):
         return float(round(v, 2))
+    if name in ("RS_SPY", "RS_Accel", "ROC") or name.startswith("SMA"):
+        return float(round(v, 1))
     return float(round(v, 2 if abs(v) < 1 else 1))
 
 
@@ -578,10 +694,23 @@ def load_daily(ticker):
     return df[~df.index.duplicated(keep="last")].dropna(subset=["Close"]).sort_index()
 
 
+def load_benchmark(index):
+    """Benchmark closes on the ticker's trading days (NaN if it can't be downloaded)."""
+    if BENCHMARK.upper() == TICKER.upper():
+        return load_daily(TICKER)["Close"].reindex(index)
+    try:
+        b = load_daily(BENCHMARK)["Close"]
+        return b.reindex(b.index.union(index)).ffill().reindex(index)
+    except (SystemExit, Exception) as e:
+        print(f"Warning: couldn't download {BENCHMARK} ({e}); RS fields will be blank.")
+        return pd.Series(np.nan, index=index)
+
+
 def prepare():
     daily = load_daily(TICKER)
+    daily["Bench"] = load_benchmark(daily.index)
     hist = build_history(daily)
-    valid = hist[NUM_KEYS].notna().all(axis=1)
+    valid = hist[CORE_KEYS].notna().all(axis=1)
     if not valid.any():
         raise SystemExit(f"{TICKER}: not enough history to warm up the monthly indicators.")
     end = hist.index.max()
@@ -667,6 +796,8 @@ def latest_status(win, rules):
 
 
 def fmt_val(k, v):
+    if v is None or pd.isna(v):
+        return "n/a"
     if k in BOOL_KEYS:
         return "yes" if v == 1 else "no"
     return f"{v:,.{min(DECIMALS[k.split('_', 1)[1]], 2)}f}"
@@ -733,10 +864,10 @@ def run_alerts(win, suggest, rules, split_date, force=False):
     lines += ["Today's readings (Daily / Weekly / Monthly):"]
     for name, lab, *_ in NUM_FIELDS:
         vals = " / ".join(fmt_val(f"{tf}_{name}", last[f"{tf}_{name}"]) for tf, _, _ in TIMEFRAMES)
-        lines.append(f"  {lab:<28} {vals}")
+        lines.append(f"  {lab:<40} {vals}")
     for name, lab in BOOL_FIELDS:
         vals = " / ".join(fmt_val(f"{tf}_{name}", last[f"{tf}_{name}"]) for tf, _, _ in TIMEFRAMES)
-        lines.append(f"  {lab:<28} {vals}")
+        lines.append(f"  {lab:<40} {vals}")
     if os.environ.get("DASHBOARD_URL"):
         lines += ["", f"Dashboard: {os.environ['DASHBOARD_URL']}"]
     lines += ["", "Automated scanner alert based on historical indicator behavior. Not financial advice."]
@@ -793,8 +924,9 @@ def build_report(win, opt_start, split_date, suggest, rules):
         "optYears": OPTIMIZER_YEARS,
         "meta": meta,
         "tfs": [{"tf": tf, "name": name} for tf, name, _ in TIMEFRAMES],
-        "numNames": [{"name": n, "label": lab, "step": s} for n, lab, s, _ in NUM_FIELDS],
-        "boolNames": [{"name": n, "label": lab} for n, lab in BOOL_FIELDS],
+        "numNames": [{"name": n, "label": lab, "step": s, "short": SHORT.get(n, n)} for n, lab, s, _ in NUM_FIELDS],
+        "boolNames": [{"name": n, "label": lab, "short": SHORT.get(n, n)} for n, lab in BOOL_FIELDS],
+        "bench": BENCHMARK,
         "slots": [{"id": s, "label": lab, "dir": d, "var": var} for s, lab, d, var, _ in SLOTS],
         "rules": {s: {"conds": rules[s]["conds"], "source": rules[s]["source"]} for s in rules},
         "suggest": {str(h): {s: sug(g) for s, g in by_slot.items()} for h, by_slot in suggest.items()},
@@ -897,6 +1029,9 @@ __PLOTLY__
   .bk { display:inline-block; min-width:62px; text-align:center; border-radius:4px; padding:2px 4px; }
   .callout { border-left:3px solid #2a78d6; background:#f3f7fc; padding:8px 12px; border-radius:4px; font-size:13px; margin:8px 0; line-height:1.5; }
   td.b { font-weight:700; }
+  table.det { width:auto; min-width:420px; } table.det td, table.det th { padding:3px 10px; }
+  table.det tr.sep td { background:#f7f6f2; font-weight:600; font-size:12px; color:__INK2__; }
+  table.det tr.used td { background:#eef4fb; font-weight:600; }
   a { color:#2a78d6; }
 </style></head><body><div class="wrap">
 <h1>__TICKER__ multi-timeframe buy &amp; sell signals: backtest</h1>
@@ -946,7 +1081,9 @@ Forward horizons are in trading days (about 21 per month). Everything below foll
   <div class="tscroll"><table class="grid" id="grid"></table></div>
   <div class="note">All filled-in conditions must pass (AND). Leave a box empty for no limit; an empty rule never fires. The small line
   under each box is the latest close's value (green = passes this rule's condition). Numbers are on the notebook's scales: RSI, %K, %D
-  and MFI 0 to 100, CMF -1 to 1, MACD fields in dollars (the "% of price" versions compare better across years).</div>
+  and MFI 0 to 100, CMF -1 to 1, MACD fields in dollars (the "% of price" versions compare better across years). Relative volume is a
+  multiple (1 = normal, 2 = double the recent average). Price vs SMA, RS, RS acceleration and ROC are in %: +3 = 3% above the SMA / 3%
+  ahead of the benchmark / up 3%. Lookbacks count bars of each timeframe. "n/a" = not enough history yet for that indicator.</div>
 </div>
 
 <div class="card"><h2>Rule results <span class="pill" id="resPill"></span></h2>
@@ -965,7 +1102,10 @@ Forward horizons are in trading days (about 21 per month). Everything below foll
   <div id="priceChart"></div>
   <div class="note">Marker shape = rule (▲ Buy 1, ● Buy 2, ▼ Sell 1, ■ Sell 2), fill = forward return at the selected horizon.
   Markers are drawn a little below (buys) or above (sells) the close so signals on the same day don't hide each other; hover shows the
-  actual close. Click a legend entry to hide a rule. Shaded area = the optimizer's test period.</div>
+  actual close, forward returns and every indicator's Daily / Weekly / Monthly value that day (bold = used in that rule). Hovering or
+  clicking a marker also fills the table below. Click a legend entry to hide a rule. Shaded area = the optimizer's test period.</div>
+  <div class="row" style="margin:4px 0"><label class="ctl"><input type="checkbox" id="fullHover" checked> full indicator readout in the tooltip</label></div>
+  <div id="sigDetail" class="tscroll"><div class="note">Hover over or click a buy/sell marker to see its full Daily / Weekly / Monthly indicator readout here.</div></div>
 </div>
 
 <div class="card"><h2>Round trips: how long from buy to sell <span class="pill" id="tripPill"></span></h2>
@@ -1344,13 +1484,13 @@ function chart(ST, M) {
     hovertemplate: '%{x|%b %d, %Y}<br>Close $%{y:,.2f}<extra></extra>', showlegend: false}];
   SLOTS.forEach(s => {
     if (!ruleKeys(s.id).length) return;
-    const st = ST[s.id], y = STY[s.id], X = [], Y = [], c = [], cd = [];
+    const st = ST[s.id], y = STY[s.id], X = [], Y = [], c = [], cd = [], tx = [], full = $('fullHover').checked;
     st.idx.forEach(i => { X.push(D.dates[i]); Y.push(D.close[i] * y.off); c.push(color(D.fwd[H][i], cap));
-      cd.push([D.close[i], ...D.fwdDays.map(n => pct(D.fwd[String(n)][i]))]); });
-    tr.push({type: 'scatter', mode: 'markers', x: X, y: Y, customdata: cd, name: `${s.label} (${st.n})`,
+      cd.push([i, s.id]); tx.push(hoverText(i, s.id, full)); });
+    tr.push({type: 'scatter', mode: 'markers', x: X, y: Y, customdata: cd, text: tx, name: `${s.label} (${st.n})`,
       marker: {symbol: y.sym, size: s.id.endsWith('2') ? 9 : 10, color: c, line: {color: y.col, width: 1.4}},
-      hovertemplate: `<b>${s.label.toUpperCase()}</b> %{x|%b %d, %Y}<br>Close $%{customdata[0]:,.2f}<br>` +
-        D.fwdDays.map((n, j) => `${n}D fwd: %{customdata[${j + 1}]}`).join(' · ') + '<extra></extra>'});
+      hoverlabel: {align: 'left', font: {family: 'Consolas, Menlo, "DejaVu Sans Mono", monospace', size: 11, color: INK}, bgcolor: '#fff', bordercolor: y.col},
+      hovertemplate: '%{text}<extra></extra>'});
   });
   if ($('showTrips').checked) {
     const p = PAIRS.find(x => x.id === $('chartPair').value);
@@ -1372,12 +1512,51 @@ function chart(ST, M) {
     shapes.push({type: 'rect', xref: 'x', yref: 'paper', x0, x1: D.dates[RB], y0: 0, y1: 1, fillcolor: '#2a78d6', opacity: 0.05, line: {width: 0}});
     ann.push({x: x0, y: 1, xref: 'x', yref: 'paper', text: 'test period →', showarrow: false, xanchor: 'left', yanchor: 'top', font: {size: 11, color: '#2a78d6'}});
   }
-  const lay = {height: 560, margin: {l: 60, r: 20, t: 80, b: 40}, plot_bgcolor: SURF, paper_bgcolor: '#fff', uirevision: `${RA}-${RB}`,
+  const lay = {height: 680, margin: {l: 60, r: 20, t: 80, b: 40}, plot_bgcolor: SURF, paper_bgcolor: '#fff', uirevision: `${RA}-${RB}`,
     font: {family: 'Inter, Segoe UI, Arial, sans-serif', color: INK2, size: 12}, hoverlabel: {bgcolor: '#fff', font: {color: INK}},
     legend: {orientation: 'h', x: 0, xanchor: 'left', y: 1.02, yanchor: 'bottom', font: {size: 11}},
     xaxis: {showgrid: false, linecolor: GRIDC, range: [D.dates[RA], D.dates[RB]], rangeslider: {visible: true, thickness: 0.06, range: [D.dates[RA], D.dates[RB]]}},
     yaxis: {type: $('logY').checked ? 'log' : 'linear', gridcolor: GRIDC, tickprefix: '$'}, shapes, annotations: ann};
   Plotly.react('priceChart', tr, lay, {displaylogo: false, responsive: true});
+  const el = $('priceChart');
+  if (!el._detailHooked && el.on) {
+    el._detailHooked = true;
+    const pick = ev => { const p = ev && ev.points && ev.points.find(q => Array.isArray(q.customdata)); if (p) detail(p.customdata[0], p.customdata[1]); };
+    el.on('plotly_hover', pick); el.on('plotly_click', pick);
+  }
+}
+
+// ---------- full D/W/M readout for one signal day (tooltip + panel) ----------
+const NBSP = '\u00a0';
+const padR = (t, w) => t.length >= w ? t.slice(0, w) : t + NBSP.repeat(w - t.length);
+const padL = (t, w) => t.length >= w ? t : NBSP.repeat(w - t.length) + t;
+const esh = t => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+function firedOn(i) { return lastM ? SLOTS.filter(s => ruleKeys(s.id).length && lastM[s.id][i]).map(s => s.id) : []; }
+function hoverText(i, sid, full) {
+  let t = `<b>${SL[sid].label.toUpperCase()}</b> ${fmtDate(D.dates[i])} · Close $${D.close[i].toFixed(2)}<br>` +
+    D.fwdDays.map(n => `${n}D ${pct(D.fwd[String(n)][i], 1)}`).join(' · ');
+  if (!full) return t;
+  const used = new Set(ruleKeys(sid)), W = 13, C = 9;
+  const row = (n, isBool) => { const ks = D.tfs.map(tf => `${tf.tf}_${n.name}`);
+    const line = esh(padR(n.short, W)) + ks.map(k => padL(fmtVal(k, F[k][i]), C)).join('');
+    return ks.some(k => used.has(k)) ? `<b>${line}</b>` : line; };
+  t += '<br>' + padR('', W) + D.tfs.map(tf => padL(tf.name, C)).join('');
+  t += '<br>' + D.numNames.map(n => row(n)).join('<br>');
+  t += '<br>' + D.boolNames.map(n => row(n, true)).join('<br>');
+  return t;
+}
+function detail(i, sid) {
+  const used = new Set(ruleKeys(sid)), fired = firedOn(i);
+  const row = n => { const ks = D.tfs.map(tf => `${tf.tf}_${n.name}`);
+    return `<tr class="${ks.some(k => used.has(k)) ? 'used' : ''}"><td>${esc(n.label)}</td>` +
+      ks.map(k => `<td class="num${used.has(k) ? ' b' : ''}">${fmtVal(k, F[k][i])}</td>`).join('') + '</tr>'; };
+  $('sigDetail').innerHTML = `<h2 style="font-size:14px;margin-top:10px">${fired.map(chip).join('')} ${fmtDate(D.dates[i])} · close $${D.close[i].toFixed(2)}
+    <span class="pill">${D.fwdDays.map(n => `${n}D ${pct(D.fwd[String(n)][i])}`).join(' · ')}</span></h2>
+    <table class="det"><tr><th>Indicator</th>${D.tfs.map(t => `<th class="num">${t.name}</th>`).join('')}</tr>
+    <tr class="sep"><td colspan="${D.tfs.length + 1}">Values</td></tr>${D.numNames.map(row).join('')}
+    <tr class="sep"><td colspan="${D.tfs.length + 1}">Yes / no</td></tr>${D.boolNames.map(row).join('')}</table>
+    <div class="note">Highlighted rows = fields in the ${esc(SL[sid].label)} rule. Weekly and Monthly are the week-to-date and month-to-date
+    values as they read after this day's close.</div>`;
 }
 
 // ---------- heatmap (bins from the values inside the date range) ----------
@@ -1572,7 +1751,7 @@ function postHeight() {
   $('horizon').onchange = () => { H = $('horizon').value; render(); };
   $('period').onchange = () => { applyPeriod(); render(); };
   ['from', 'to'].forEach(id => $(id).addEventListener('change', () => { $('period').value = 'custom'; applyPeriod(); render(); }));
-  ['heatCtx', 'logY', 'showTrips', 'chartPair'].forEach(id => $(id).addEventListener('change', render));
+  ['heatCtx', 'logY', 'showTrips', 'chartPair', 'fullHover'].forEach(id => $(id).addEventListener('change', render));
   $('tripPair').onchange = () => { $('chartPair').value = $('tripPair').value; render(); };
 
   $('saveBtn').onclick = () => {

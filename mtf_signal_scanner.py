@@ -33,6 +33,11 @@ Daily, 20 weeks on Weekly, 20 months on Monthly), like the notebook's RSI 14 etc
   RS_Accel    RS acceleration = RS_SPY now minus RS_SPY RS_ACCEL_PERIOD bars ago.
               Positive = relative strength is improving.
   ROC         price momentum, rate of change = % change of the close over ROC_PERIOD bars
+  RSI_Slope   RSI direction: RSI now minus RSI RSI_SLOPE_PERIOD (3) bars ago.
+              Positive = RSI is turning up, e.g. +5 = up 5 RSI points in 3 bars.
+  RSI_Rising  yes/no: RSI is higher than on the previous bar.
+              (Weekly/Monthly compare the week/month-to-date RSI with the last
+              completed bars, so they are noisier early in a week or month.)
 
 Hover over any buy/sell marker on the price chart to see every indicator's Daily,
 Weekly and Monthly value on that day (also shown in the panel under the chart).
@@ -124,8 +129,8 @@ DATA_PERIOD = "max"
 #   }
 #
 # Field names: RSI, StochK, StochD, MFI, CMF, MACD, Signal, Hist, MACD_Pct, Hist_Pct,
-#              RVOL, SMA5_Pct, SMA10_Pct, SMA20_Pct, SMA50_Pct, RS_SPY, RS_Accel, ROC,
-#              MACD_Bull, MACD_Pos, Hist_Rising, Stoch_Bull, Flow_Bull, Candle_Up,
+#              RSI_Slope, RVOL, SMA5_Pct, SMA10_Pct, SMA20_Pct, SMA50_Pct, RS_SPY, RS_Accel, ROC,
+#              MACD_Bull, MACD_Pos, Hist_Rising, RSI_Rising, Stoch_Bull, Flow_Bull, Candle_Up,
 #              Above_SMA5, Above_SMA10, Above_SMA20, Above_SMA50, SMA_Stack_Bull, SMA_Stack_Bear
 #   e.g. BUY_RULE = {"D_RVOL": (1.5, None), "W_RS_SPY": (0, None), "D_Above_SMA50": True}
 BUY_RULE = "auto"
@@ -150,6 +155,7 @@ BENCHMARK = os.environ.get("SIGNAL_BENCHMARK", "SPY")   # relative strength is m
 RVOL_PERIOD = 20             # relative volume: compare with the average of the previous N bars
 RS_PERIOD = 20               # RS vs SPY: change of the price ratio over N bars
 RS_ACCEL_PERIOD = 5          # RS acceleration: RS now minus RS this many bars ago
+RSI_SLOPE_PERIOD = 3         # RSI direction: RSI now minus RSI this many bars ago
 ROC_PERIOD = 12              # price momentum: % change over N bars (12 = the classic ROC setting)
 SMA_PERIODS = [5, 10, 20, 50] # "Price vs SMA": one % field + one yes/no field per SMA
                              # (field names follow the numbers: SMA5_Pct, Above_SMA5, ...)
@@ -217,6 +223,7 @@ TIMEFRAMES = [("D", "Daily", "D"), ("W", "Weekly", "W-FRI"), ("M", "Monthly", "M
 
 NUM_FIELDS = [   # name, label, step for the filter input, decimals kept
     ("RSI", "RSI (14)", 1, 2),
+    ("RSI_Slope", f"RSI slope ({RSI_SLOPE_PERIOD}-bar change)", 1, 2),
     ("StochK", "Stochastic %K", 1, 2),
     ("StochD", "Stochastic %D", 1, 2),
     ("MFI", "MFI (14)", 1, 2),
@@ -236,6 +243,7 @@ BOOL_FIELDS = [
     ("MACD_Bull", "MACD above signal"),
     ("MACD_Pos", "MACD above 0"),
     ("Hist_Rising", "Histogram rising (green bar)"),
+    ("RSI_Rising", "RSI rising (vs previous bar)"),
     ("Stoch_Bull", "%K above %D"),
     ("Flow_Bull", "MFI > 50 and CMF > 0"),
     ("Candle_Up", "Candle up (close > open)"),
@@ -244,7 +252,7 @@ BOOL_FIELDS = [
     ("SMA_Stack_Bear", "SMAs stacked bearish (" + " < ".join(map(str, SMA_PERIODS)) + ")"),
 ]
 # Short names for the chart tooltip
-SHORT = {"RSI": "RSI 14", "StochK": "Stoch %K", "StochD": "Stoch %D", "MFI": "MFI 14", "CMF": "CMF 20",
+SHORT = {"RSI": "RSI 14", "RSI_Slope": f"RSI slope {RSI_SLOPE_PERIOD}", "RSI_Rising": "RSI rising", "StochK": "Stoch %K", "StochD": "Stoch %D", "MFI": "MFI 14", "CMF": "CMF 20",
          "MACD": "MACD $", "Signal": "MACD sig $", "Hist": "MACD hist $", "MACD_Pct": "MACD %px",
          "Hist_Pct": "Hist %px", "RVOL": "Rel volume", "RS_SPY": f"RS vs {BENCHMARK}"[:12], "RS_Accel": "RS accel",
          "ROC": f"ROC {ROC_PERIOD} %", "MACD_Bull": "MACD>sig", "MACD_Pos": "MACD>0",
@@ -253,7 +261,7 @@ SHORT = {"RSI": "RSI 14", "StochK": "Stoch %K", "StochD": "Stoch %D", "MFI": "MF
          **{f"SMA{p}_Pct": f"vs SMA{p} %" for p in SMA_PERIODS}, **{f"Above_SMA{p}": f">SMA{p}" for p in SMA_PERIODS}}
 # The optimizer skips raw-dollar MACD fields: $ values from a $20 stock and a $400 stock
 # aren't comparable, so it uses the % of price versions instead.
-OPT_NUM_FIELDS = ["RSI", "StochK", "StochD", "MFI", "CMF", "MACD_Pct", "Hist_Pct",
+OPT_NUM_FIELDS = ["RSI", "RSI_Slope", "StochK", "StochD", "MFI", "CMF", "MACD_Pct", "Hist_Pct",
                   "RVOL", *[f"SMA{p}_Pct" for p in SMA_PERIODS], "RS_SPY", "RS_Accel", "ROC"]
 # The backtest window starts once these are warmed up on all three timeframes. The added
 # indicators can need more history (a 50-month SMA needs 4+ years), so they may be blank
@@ -457,6 +465,7 @@ def partial_bar_indicators(daily: pd.DataFrame, freq: str) -> pd.DataFrame:
     return pd.DataFrame({
         "Open": O, "Close": C, "MACD": macd, "Signal": sig, "RSI": rsi_p, "%K": k_p, "%D": d_stoch,
         "MFI": mfi_p, "CMF": cmf_p, "Hist_Prev": prev(ind["MACD"] - ind["Signal"]),
+        "RSI_Prev1": prev(ind["RSI"]), "RSI_PrevN": prev(ind["RSI"], RSI_SLOPE_PERIOD),
         "RVOL": rvol_p, **smas, "ROC": roc_p, "RS": rs_p, "RS_Accel": rs_acc_p,
     }, index=daily.index)
 
@@ -466,6 +475,9 @@ def timeframe_fields(tf: str, x: pd.DataFrame) -> pd.DataFrame:
     hist = x["MACD"] - x["Signal"]
     hist_prev = x["Hist_Prev"] if "Hist_Prev" in x else hist.shift(1)
     known = x[["MACD", "Signal", "RSI", "%K", "%D", "MFI", "CMF"]].notna().all(axis=1)
+    # RSI direction vs completed earlier bars (Daily: plain shifts)
+    rsi_prev1 = x["RSI_Prev1"] if "RSI_Prev1" in x else x["RSI"].shift(1)
+    rsi_prevn = x["RSI_PrevN"] if "RSI_PrevN" in x else x["RSI"].shift(RSI_SLOPE_PERIOD)
 
     def flag(cond, ok=known):
         return cond.astype(float).where(ok)
@@ -480,7 +492,7 @@ def timeframe_fields(tf: str, x: pd.DataFrame) -> pd.DataFrame:
         stack_bear &= sma[a] < sma[b]
 
     out = pd.DataFrame({
-        "RSI": x["RSI"], "StochK": x["%K"], "StochD": x["%D"], "MFI": x["MFI"], "CMF": x["CMF"],
+        "RSI": x["RSI"], "RSI_Slope": x["RSI"] - rsi_prevn, "StochK": x["%K"], "StochD": x["%D"], "MFI": x["MFI"], "CMF": x["CMF"],
         "MACD": x["MACD"], "Signal": x["Signal"], "Hist": hist,
         "MACD_Pct": x["MACD"] / x["Close"] * 100, "Hist_Pct": hist / x["Close"] * 100,
         "RVOL": x["RVOL"],
@@ -491,6 +503,7 @@ def timeframe_fields(tf: str, x: pd.DataFrame) -> pd.DataFrame:
         "MACD_Pos": flag(x["MACD"] > 0),
         "Hist_Rising": flag(hist_prev.isna() | (hist >= hist_prev)),
         "Stoch_Bull": flag(x["%K"] > x["%D"]),
+        "RSI_Rising": flag(x["RSI"] > rsi_prev1, x["RSI"].notna() & rsi_prev1.notna()),
         "Flow_Bull": flag((x["MFI"] > 50) & (x["CMF"] > 0)),
         "Candle_Up": flag(x["Close"] > x["Open"]),
         **{f"Above_SMA{p}": flag(x["Close"] > sma[p], sma[p].notna()) for p in SMA_PERIODS},
@@ -587,7 +600,7 @@ def nice(name, v):
         return float(round(v))
     if name in ("CMF", "RVOL"):
         return float(round(v, 2))
-    if name in ("RS_SPY", "RS_Accel", "ROC") or name.startswith("SMA"):
+    if name in ("RS_SPY", "RS_Accel", "ROC", "RSI_Slope") or name.startswith("SMA"):
         return float(round(v, 1))
     return float(round(v, 2 if abs(v) < 1 else 1))
 
@@ -1081,7 +1094,7 @@ Forward horizons are in trading days (about 21 per month). Everything below foll
   <div class="tscroll"><table class="grid" id="grid"></table></div>
   <div class="note">All filled-in conditions must pass (AND). Leave a box empty for no limit; an empty rule never fires. The small line
   under each box is the latest close's value (green = passes this rule's condition). Numbers are on the notebook's scales: RSI, %K, %D
-  and MFI 0 to 100, CMF -1 to 1, MACD fields in dollars (the "% of price" versions compare better across years). Relative volume is a
+  and MFI 0 to 100 (RSI slope = RSI points gained over the last few bars, + = turning up), CMF -1 to 1, MACD fields in dollars (the "% of price" versions compare better across years). Relative volume is a
   multiple (1 = normal, 2 = double the recent average). Price vs SMA, RS, RS acceleration and ROC are in %: +3 = 3% above the SMA / 3%
   ahead of the benchmark / up 3%. Lookbacks count bars of each timeframe. "n/a" = not enough history yet for that indicator.</div>
 </div>

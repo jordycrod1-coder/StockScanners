@@ -1,0 +1,127 @@
+{
+  "ticker": "TSLA",
+  "saved": "2026-09-30T04:19:01.850Z",
+  "horizon": 42,
+  "rules": {
+    "buy1": {
+      "W_Hist": [
+        null,
+        8
+      ],
+      "D_Above_SMA5": true,
+      "D_Above_SMA10": true,
+      "D_Above_SMA20": false,
+      "D_ROC": [
+        -4,
+        null
+      ]
+    },
+    "buy2": {},
+    "sell1": {
+      "W_Hist": [
+        0,
+        null
+      ],
+      "W_StochK": [
+        57,
+        null
+      ],
+      "D_StochK": [
+        75,
+        null
+      ],
+      "D_Hist_Rising": false,
+      "D_Candle_Up": false
+    },
+    "sell2": {}
+  },
+  "library": [
+    {
+      "name": "Buy 1: Monthly MACD above signal: no AND Weekly MACD histogram ($) ≤ -9.5 AND We",
+      "kind": "buy",
+      "rule": {
+        "M_MACD_Bull": false,
+        "W_Hist": [
+          null,
+          -9.5
+        ],
+        "W_MFI": [
+          null,
+          45
+        ]
+      },
+      "ticker": "TSLA",
+      "saved": "2026-09-25"
+    },
+    {
+      "name": "Buy 2: Daily Stochastic %K ≤ 18 AND Weekly RSI (14) ≤ 53",
+      "kind": "buy",
+      "rule": {
+        "D_StochK": [
+          null,
+          18
+        ],
+        "W_RSI": [
+          null,
+          53
+        ]
+      },
+      "ticker": "TSLA",
+      "saved": "2026-09-25"
+    },
+    {
+      "name": "SELL-TSLA-STOCHASTIC",
+      "kind": "sell",
+      "rule": {
+        "W_Hist": [
+          0,
+          null
+        ],
+        "W_StochK": [
+          57,
+          null
+        ],
+        "D_StochK": [
+          75,
+          null
+        ],
+        "D_Hist_Rising": false,
+        "D_Candle_Up": false
+      },
+      "ticker": "TSLA",
+      "saved": "2026-09-29"
+    },
+    {
+      "name": "BUY-DOWNTREND",
+      "kind": "buy",
+      "rule": {
+        "D_Above_SMA5": true,
+        "D_MFI": [
+          null,
+          36
+        ]
+      },
+      "ticker": "TSLA",
+      "saved": "2026-09-29"
+    },
+    {
+      "name": "BUY-ALL-V1",
+      "kind": "buy",
+      "rule": {
+        "W_Hist": [
+          null,
+          8
+        ],
+        "D_Above_SMA5": true,
+        "D_Above_SMA10": true,
+        "D_Above_SMA20": false,
+        "D_ROC": [
+          -4,
+          null
+        ]
+      },
+      "ticker": "TSLA",
+      "saved": "2026-09-30"
+    }
+  ]
+}

@@ -751,7 +751,7 @@ def prepare():
                               cands=cands, with_singles=False)
             suggest[h][f"{side}1"], suggest[h][f"{side}2"] = first, second
 
-    saved, saved_path = load_rules_file()
+    saved, saved_path, saved_names = load_rules_file()
     rules = {}
     for slot, lab, _, var, col in SLOTS:
         if saved is not None and slot in saved:
@@ -764,7 +764,15 @@ def prepare():
             conds, source = suggest[TARGET_FWD_DAYS][slot]["rule"], "auto"
         else:
             conds = parse_rule(spec, f"{lab} rule ({saved_path.name if source == 'saved' else var})")
-        rules[slot] = {"conds": conds, "source": source, "text": rule_text(conds)}
+        if not conds:
+            name = "Empty"
+        elif source == "saved":
+            name = saved_names.get(slot) or "Custom (unnamed)"
+        elif source == "auto":
+            name = f"Optimizer suggestion ({TARGET_FWD_DAYS}D)"
+        else:
+            name = f"Script setting {var}"
+        rules[slot] = {"conds": conds, "source": source, "text": rule_text(conds), "name": name}
         win[col] = rule_mask(win, conds)
     win["Period"] = np.select([win.index < opt_start, win.index < split_date], ["before_optimizer", "train"], "test")
     return win, opt_start, split_date, suggest, rules
@@ -780,17 +788,72 @@ def rules_path():
     return p
 
 
+RULES_INFO = {"found": False, "file": None, "exported": None}
+
+
+def _norm_rule(rule):
+    """Comparable form of a saved rule: {field: (min, max) | True/False}."""
+    out = {}
+    for k, v in (rule or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, (list, tuple)):
+            v = tuple(None if x is None else round(float(x), 6) for x in v)
+            if v == (None, None):
+                continue
+        out[k] = v
+    return out
+
+
+def template_name(rule, kind, library):
+    """Name of the saved library template this rule came from.
+
+    Exact match -> its name. Otherwise the library rule sharing the most identical
+    conditions (at least half of them) -> "<name> (edited)". Else "Custom (unnamed)".
+    """
+    r = _norm_rule(rule)
+    if not r:
+        return "Empty"
+    best, best_shared = None, 0
+    for item in library or []:
+        if item.get("kind") and item["kind"] != kind:
+            continue
+        lib = _norm_rule(item.get("rule"))
+        if lib == r:
+            return item.get("name") or "Unnamed template"
+        shared = sum(1 for k, v in lib.items() if r.get(k) == v)
+        if shared > best_shared:
+            best, best_shared = item, shared
+    if best and best_shared * 2 >= max(len(r), len(_norm_rule(best.get("rule")))):
+        return f"{best.get('name') or 'Unnamed template'} (edited)"
+    return "Custom (unnamed)"
+
+
 def load_rules_file():
-    """Rules exported from the report (dict of slot -> {field: [min, max] | true/false})."""
+    """Rules exported from the report (dict of slot -> {field: [min, max] | true/false}).
+
+    Returns (rules, path, names). names = slot -> template name: taken from the file's
+    "names" block (written by newer reports), else matched against its saved library.
+    """
     p = rules_path()
     if not p.exists():
-        return None, p
+        print(f"No rules file at {p}: slots fall back to the script settings / optimizer suggestions.")
+        return None, p, {}
     data = json.loads(p.read_text(encoding="utf-8"))
     if data.get("ticker") and data["ticker"].upper() != TICKER.upper():
         print(f"Note: {p.name} was saved from the {data['ticker']} report; using it for {TICKER} anyway.")
     rules = {k: v for k, v in (data.get("rules") or {}).items() if k in SLOT_LABEL}
-    print(f"Using saved rules from {p.name}: {', '.join(SLOT_LABEL[k] for k in rules) or 'none'}")
-    return rules, p
+    saved_names = data.get("names") or {}
+    names = {}
+    for slot, *_ in SLOTS:
+        if slot not in rules:
+            continue
+        kind = "buy" if slot.startswith("buy") else "sell"
+        names[slot] = saved_names.get(slot) or template_name(rules[slot], kind, data.get("library"))
+    RULES_INFO.update(found=True, file=p.name, exported=data.get("saved"))
+    print(f"Using saved rules from {p.name}: " +
+          (", ".join(f"{SLOT_LABEL[k]} = {names[k]}" for k in rules) or "none"))
+    return rules, p, names
 
 
 # ============================================================
@@ -851,7 +914,7 @@ def run_alerts(win, suggest, rules, split_date, force=False):
         if not rules[slot]["conds"]:
             print(f"{lab.upper()}: no rule conditions - skipped.")
             continue
-        print(f"{lab.upper()} rule ({rules[slot]['source']}): {rules[slot]['text']} -> "
+        print(f"{lab.upper()} [{rules[slot]['name']}] ({rules[slot]['source']}): {rules[slot]['text']} -> "
               f"{'FIRES' if st['fires'] else 'no signal'}"
               + (f" (day {st['streak']} in a row)" if st["fires"] else ""))
         if st["fires"] and (ALERT_MODE == "every" or st["streak"] == 1):
@@ -866,15 +929,22 @@ def run_alerts(win, suggest, rules, split_date, force=False):
         te = suggest[TARGET_FWD_DAYS][slot]["test"] if r["source"] == "auto" else stats(
             win[SLOT_COL[slot]].values[win.index >= split_date],
             win[f"Fwd_{TARGET_FWD_DAYS}D%"].values[win.index >= split_date])
-        lines += [f"=== {SLOT_LABEL[slot].upper()} ALERT (day {st['streak']} in a row) ===",
-                  f"Rule ({SOURCE_TEXT[r['source']]}):"]
+        lines += [f"=== {SLOT_LABEL[slot].upper()} ALERT: {r['name']} (day {st['streak']} in a row) ===",
+                  f"Template: {r['name']} ({SOURCE_TEXT[r['source']]})", "Conditions:"]
         lines += [f"  - {cond_text(c)}   (today: {fmt_val(c['k'], v)})" for c, v, _ in st["checks"]]
         if te["avg"] is not None:
             lines.append(f"Backtest, test period since {split_date:%b %Y}: fired on {te['n']} days, "
                          f"avg {TARGET_FWD_DAYS}-day forward return {te['avg']:+.2f}%, "
                          f"{te['win']:.0f}% of them positive.")
         lines.append("")
-    lines += ["Today's readings (Daily / Weekly / Monthly):"]
+    lines += ["Active alert setup (all four slots):"]
+    for slot, lab, *_ in SLOTS:
+        r = rules[slot]
+        state = "FIRED" if slot in fired else ("no signal" if r["conds"] else "off")
+        lines.append(f"  {lab:<7} {r['name']}  [{SOURCE_TEXT[r['source']]}]  today: {state}")
+    if RULES_INFO["found"]:
+        lines.append(f"  (rules file {RULES_INFO['file']}, exported {RULES_INFO['exported'] or 'n/a'})")
+    lines += ["", "Today's readings (Daily / Weekly / Monthly):"]
     for name, lab, *_ in NUM_FIELDS:
         vals = " / ".join(fmt_val(f"{tf}_{name}", last[f"{tf}_{name}"]) for tf, _, _ in TIMEFRAMES)
         lines.append(f"  {lab:<40} {vals}")
@@ -885,7 +955,8 @@ def run_alerts(win, suggest, rules, split_date, force=False):
         lines += ["", f"Dashboard: {os.environ['DASHBOARD_URL']}"]
     lines += ["", "Automated scanner alert based on historical indicator behavior. Not financial advice."]
     body = "\n".join(lines)
-    subject = f"{TICKER} {' + '.join(SLOT_LABEL[s].upper() for s in fired)} alert - {day:%b %d, %Y} close ${last['Close']:,.2f}"
+    fired_txt = " + ".join(f"{SLOT_LABEL[s].upper()} [{rules[s]['name']}]" for s in fired)
+    subject = f"{TICKER} {fired_txt} alert - {day:%b %d, %Y} close ${last['Close']:,.2f}"
     print("\n" + subject + "\n" + body)
     send_email(subject, body)
 
@@ -941,7 +1012,9 @@ def build_report(win, opt_start, split_date, suggest, rules):
         "boolNames": [{"name": n, "label": lab, "short": SHORT.get(n, n)} for n, lab in BOOL_FIELDS],
         "bench": BENCHMARK,
         "slots": [{"id": s, "label": lab, "dir": d, "var": var} for s, lab, d, var, _ in SLOTS],
-        "rules": {s: {"conds": rules[s]["conds"], "source": rules[s]["source"]} for s in rules},
+        "rules": {s: {"conds": rules[s]["conds"], "source": rules[s]["source"], "name": rules[s]["name"]} for s in rules},
+        "rulesFile": {"found": RULES_INFO["found"], "file": RULES_INFO["file"] or rules_path().name,
+                      "exported": RULES_INFO["exported"]},
         "suggest": {str(h): {s: sug(g) for s, g in by_slot.items()} for h, by_slot in suggest.items()},
         "opt": {"minDays": MIN_SIGNAL_DAYS, "minEp": MIN_EPISODES, "maxConds": MAX_RULE_CONDITIONS,
                 "trainPct": round(TRAIN_FRACTION * 100)},
@@ -965,7 +1038,8 @@ def build_report(win, opt_start, split_date, suggest, rules):
     if os.environ.get("BACKTEST_OUTPUT_DIR"):
         st = latest_status(win, rules)
         now = " + ".join(SLOT_LABEL[s].upper() for s, *_ in SLOTS if st[s]["fires"]) or "no signal"
-        counts = ", ".join(f"{SLOT_LABEL[s]} {int(win[SLOT_COL[s]].sum())}" for s, *_ in SLOTS if rules[s]["conds"])
+        counts = ", ".join(f"{SLOT_LABEL[s]} ({rules[s]['name']}) {int(win[SLOT_COL[s]].sum())}"
+                           for s, *_ in SLOTS if rules[s]["conds"])
         (OUT_DIR / "scanner.json").write_text(json.dumps({
             "title": f"{TICKER} Multi-Timeframe Buy/Sell Signals - Backtest",
             "order": SCANNER_ORDER,
@@ -1046,6 +1120,11 @@ __PLOTLY__
   table.det tr.sep td { background:#f7f6f2; font-weight:600; font-size:12px; color:__INK2__; }
   table.det tr.used td { background:#eef4fb; font-weight:600; }
   a { color:#2a78d6; }
+  .alertset td { vertical-align:top; }
+  .alertset .tname { font-weight:700; font-size:14px; }
+  .warn { border-left:3px solid #c98a00; background:#fdf6e3; padding:8px 12px; border-radius:4px; font-size:13px; margin:6px 0; line-height:1.5; }
+  .tabname { display:block; font-size:11px; font-weight:500; opacity:.85; max-width:190px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .diff { color:#8a5a00; font-weight:600; } .same { color:#0b5a24; font-weight:600; }
 </style></head><body><div class="wrap">
 <h1>__TICKER__ multi-timeframe buy &amp; sell signals: backtest</h1>
 <div class="sub">Data __PERIOD__ · every trading day replayed after the close with the notebook's indicators on the Daily,
@@ -1054,6 +1133,15 @@ returns) and two <b>sell rules</b> (followed by the lowest). Colors show the for
 <span class="sw" style="background:#0b5a24"></span>green = price rose afterwards,
 <span class="sw" style="background:#8e1b1b"></span>red = price fell. Good buy signals are green, good sell signals are red.
 Forward horizons are in trading days (about 21 per month). Everything below follows the date range you pick.</div>
+
+<div class="card"><h2>Email alert setup <span class="pill" id="alertPill"></span></h2>
+  <div id="alertFile"></div>
+  <div class="tscroll"><table class="alertset" id="alertSet"></table></div>
+  <div class="note">These are the four rules the scheduled scanner emails you about, loaded from the rules file in the repo on the last build.
+  The page always opens with them in the four slots. Edits you make below are for exploring only until you <b>Export rules</b> and commit
+  the file next to the script.</div>
+  <div class="row" id="draftRow" style="margin-top:6px"></div>
+</div>
 
 <div class="today" id="today"></div>
 
@@ -1117,7 +1205,10 @@ Forward horizons are in trading days (about 21 per month). Everything below foll
   Markers are drawn a little below (buys) or above (sells) the close so signals on the same day don't hide each other; hover shows the
   actual close, forward returns and every indicator's Daily / Weekly / Monthly value that day (bold = used in that rule). Hovering or
   clicking a marker also fills the table below. Click a legend entry to hide a rule. Shaded area = the optimizer's test period.</div>
-  <div class="row" style="margin:4px 0"><label class="ctl"><input type="checkbox" id="fullHover" checked> full indicator readout in the tooltip</label></div>
+  <div class="row" style="margin:4px 0"><label class="ctl"><input type="checkbox" id="fullHover" checked> full indicator readout in the tooltip</label>
+    <span style="flex:1"></span>
+    <button id="hitsCsvBtn" title="Every day in the date range where Buy 1, Buy 2, Sell 1 or Sell 2 (as currently loaded, saved or not) fired, with all D/W/M indicator values and forward returns">Download chart hits (CSV)</button>
+    <button id="hitsRulesBtn" title="The four rules behind the hits file, with their template names">Download hit rules (JSON)</button></div>
   <div id="sigDetail" class="tscroll"><div class="note">Hover over or click a buy/sell marker to see its full Daily / Weekly / Monthly indicator readout here.</div></div>
 </div>
 
@@ -1162,6 +1253,8 @@ Forward horizons are in trading days (about 21 per month). Everything below foll
 
 <div class="card"><h2 id="hitsTitle">Signal days</h2>
   <div class="row" id="hitSlots" style="margin-bottom:6px"></div>
+  <div class="row" style="margin-bottom:6px"><button class="sm" id="hitsCsvBtn2">Download these signal days with every indicator (CSV)</button>
+    <span class="hint">same file as the chart button: all four slots as currently loaded, current date range</span></div>
   <div class="tscroll"><table id="hits"></table></div>
   <div class="note">Every day in the range where a selected rule fired, newest first (up to 150 rows; tick "first day of each streak only" to see further back). Indicator columns cover every field used
   by the selected rules; bold = that field is part of a rule that fired that day. <a href="__CSV__" download>Download every day with all
@@ -1229,31 +1322,64 @@ function condOk(v, e) {
   if (e.max != null && v > e.max) return false;
   return true;
 }
-function ruleKeys(s, exclude) { return Object.keys(state[s]).filter(k => k !== exclude && MK[k] && active(state[s][k])); }
-function mask(s, exclude, emptyAll) {
-  const keys = ruleKeys(s, exclude), m = new Array(N);
+// keysOf / maskOf / descOf work on any rule object (an editor slot or the email alert rules)
+function keysOf(st, exclude) { return Object.keys(st).filter(k => k !== exclude && MK[k] && active(st[k])); }
+function ruleKeys(s, exclude) { return keysOf(state[s], exclude); }
+function maskOf(st, exclude, emptyAll) {
+  const keys = keysOf(st, exclude), m = new Array(N);
   if (!keys.length) return m.fill(!!emptyAll);
   for (let i = 0; i < N; i++) { let ok = true;
-    for (const k of keys) if (!condOk(F[k][i], state[s][k])) { ok = false; break; }
+    for (const k of keys) if (!condOk(F[k][i], st[k])) { ok = false; break; }
     m[i] = ok; }
   return m;
 }
-function ruleDesc(s) {
-  const keys = ruleKeys(s);
+function mask(s, exclude, emptyAll) { return maskOf(state[s], exclude, emptyAll); }
+function ruleDesc(s) { return descOf(state[s]); }
+function descOf(st) {
+  const keys = keysOf(st);
   if (!keys.length) return 'no conditions: the rule never fires';
-  return keys.map(k => { const e = state[s][k], m = MK[k], lab = `${m.tfName} ${m.label}`;
+  return keys.map(k => { const e = st[k], m = MK[k], lab = `${m.tfName} ${m.label}`;
     if (e.sel != null) return `${lab}: ${e.sel ? 'yes' : 'no'}`;
     if (e.min != null && e.max != null) return `${lab} ${e.min} to ${e.max}`;
     return e.min != null ? `${lab} ≥ ${e.min}` : `${lab} ≤ ${e.max}`; }).join(' AND ');
 }
 
 // ---------- saving: python-style rule format {field: [min, max] | true/false} ----------
-function toPy(s) {
+function toPyOf(st) {
   const o = {};
-  ruleKeys(s).forEach(k => { const e = state[s][k];
+  keysOf(st).forEach(k => { const e = st[k];
     o[k] = e.sel != null ? e.sel === 1 : [e.min ?? null, e.max ?? null]; });
   return o;
 }
+function toPy(s) { return toPyOf(state[s]); }
+// order-independent fingerprint of a rule, to tell whether two rules are the same
+const canon = o => JSON.stringify(Object.keys(o || {}).sort().map(k => [k, o[k]]));
+
+// ---------- template names: which saved rule is loaded in each slot ----------
+const slotSrc = {};   // slot -> {name, base: fingerprint when it was loaded}
+function setSlotName(s, name) { if (name) slotSrc[s] = {name, base: canon(toPy(s))}; else delete slotSrc[s]; }
+function slotName(s) {
+  if (!ruleKeys(s).length) return 'Empty';
+  const r = slotSrc[s];
+  if (!r) return 'Custom (unnamed)';
+  return r.base === canon(toPy(s)) ? r.name : `${r.name.replace(/ \(edited\)$/, '')} (edited)`;
+}
+// match a rule against the saved library (same logic as the Python script)
+function libraryName(py, kind, lib) {
+  const r = canon(py); if (r === '[]') return 'Empty';
+  let best = null, bestShared = 0;
+  for (const it of lib || []) {
+    if (it.kind && it.kind !== kind) continue;
+    if (canon(it.rule) === r) return it.name;
+    const shared = Object.keys(it.rule || {}).filter(k => JSON.stringify(it.rule[k]) === JSON.stringify(py[k])).length;
+    if (shared > bestShared) { best = it; bestShared = shared; }
+  }
+  if (best && bestShared * 2 >= Math.max(Object.keys(py).length, Object.keys(best.rule || {}).length)) return `${best.name} (edited)`;
+  return 'Custom (unnamed)';
+}
+const kindOf = s => SL[s].dir > 0 ? 'buy' : 'sell';
+const ALERT = Object.fromEntries(SLOTS.map(s => [s.id, condsToState(D.rules[s.id].conds)]));
+const ALERT_M = Object.fromEntries(SLOTS.map(s => [s.id, maskOf(ALERT[s.id])]));
 function fromPy(o) {
   const s = {};
   Object.entries(o || {}).forEach(([k, v]) => {
@@ -1264,12 +1390,13 @@ function fromPy(o) {
   return s;
 }
 const STORE = (() => { try { const t = '__mtf'; localStorage.setItem(t, '1'); localStorage.removeItem(t); return localStorage; } catch (e) { return null; } })();
-const KEY_CUR = `mtfScanner:${D.ticker}:current`, KEY_LIB = 'mtfScanner:library';
+const KEY_CUR = `mtfScanner:${D.ticker}:current`, KEY_LIB = 'mtfScanner:library', KEY_PREV = `mtfScanner:${D.ticker}:lastEdits`;
 function sget(k) { try { return STORE ? JSON.parse(STORE.getItem(k)) : null; } catch (e) { return null; } }
 function sset(k, v) { try { if (!STORE) return false; STORE.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } }
 let library = sget(KEY_LIB) || [];
 function autosave() {
-  sset(KEY_CUR, {rules: Object.fromEntries(SLOTS.map(s => [s.id, toPy(s.id)])), H, period: $('period').value,
+  sset(KEY_CUR, {rules: Object.fromEntries(SLOTS.map(s => [s.id, toPy(s.id)])),
+    names: Object.fromEntries(SLOTS.map(s => [s.id, slotName(s.id)])), H, period: $('period').value,
     from: $('from').value, to: $('to').value, side});
 }
 function note(msg) { $('saveNote').innerHTML = msg; }
@@ -1282,9 +1409,9 @@ function drawLib() {
   $('libSel').innerHTML = library.length ? library.map((r, j) => `<option value="${j}">[${r.kind}] ${esc(r.name)}</option>`).join('')
     : '<option value="">no saved rules yet</option>';
 }
-function download(name, text) {
+function download(name, text, type) {
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([text], {type: 'application/json'}));
+  a.href = URL.createObjectURL(new Blob([text], {type: type || 'application/json'}));
   a.download = name; document.body.appendChild(a); a.click(); a.remove();
 }
 function pyText() {
@@ -1328,7 +1455,8 @@ function applyPeriod() {
 // ---------- rule grid ----------
 function drawTabs() {
   $('tabs').innerHTML = SLOTS.map(s => `<button class="tab${s.id === side ? ' on' : ''}" data-side="${s.id}" style="${s.id === side ?
-    `background:${STY[s.id].col};border-color:${STY[s.id].col}` : `color:${STY[s.id].col}`}">${STY[s.id].mark} ${s.label}</button>`).join('');
+    `background:${STY[s.id].col};border-color:${STY[s.id].col}` : `color:${STY[s.id].col}`}" title="${esc(slotName(s.id))}">${STY[s.id].mark} ${s.label}` +
+    `<span class="tabname">${esc(slotName(s.id))}</span></button>`).join('');
   $('tabs').querySelectorAll('.tab').forEach(b => b.onclick = () => { side = b.dataset.side; drawTabs(); fillGrid(); render(); });
 }
 function drawGrid() {
@@ -1367,7 +1495,10 @@ function fillGrid() {
     el.className = 'now' + (active(e) ? (condOk(v, e) ? ' ok' : ' bad') : '');
   });
   const src = {auto: 'optimizer suggestion', settings: 'script settings', saved: 'saved rules file'}[D.rules[side].source];
-  $('ruleText').textContent = `Editing ${SL[side].label}` + (ruleKeys(side).length ? '' : ' (empty)') + ` · scanner's alert rule comes from the ${src}`;
+  const same = canon(toPy(side)) === canon(toPyOf(ALERT[side]));
+  $('ruleText').innerHTML = `Editing <b>${SL[side].label}</b> · template: <b>${esc(slotName(side))}</b> · emails use ` +
+    `<b>${esc(D.rules[side].name)}</b> (${src}) · ` + (same ? '<span class="same">editor = email rule</span>'
+      : '<span class="diff">editor differs from the email rule</span>');
 }
 
 // ---------- stats (inside the date range) ----------
@@ -1386,7 +1517,7 @@ function results(ST) {
     `<th class="num">Median ${H}D</th><th class="num">% positive</th><th class="num">Edge vs all days</th></tr>` +
     SLOTS.map(s => { const st = ST[s.id], edge = st.avg === null || b === null ? null : st.avg - b;
       const good = edge === null ? '' : (edge * s.dir > 0 ? 'color:#0b5a24' : 'color:#8e1b1b');
-      return `<tr><td>${chip(s.id)} ${s.label}</td><td class="wrapcell hint">${esc(ruleDesc(s.id))}</td><td class="num">${st.n.toLocaleString()}</td>` +
+      return `<tr><td>${chip(s.id)} ${s.label}<br><span class="hint">${esc(slotName(s.id))}</span></td><td class="wrapcell hint">${esc(ruleDesc(s.id))}</td><td class="num">${st.n.toLocaleString()}</td>` +
         `<td class="num">${st.ep}</td><td class="num"><span class="sw" style="background:${color(st.avg, hc)}"></span>${pct(st.avg)}</td>` +
         `<td class="num">${pct(st.med)}</td><td class="num">${st.win === null ? 'n/a' : st.win.toFixed(0) + '%'}</td>` +
         `<td class="num" style="${good};font-weight:600">${pct(edge)}</td></tr>`; }).join('') +
@@ -1401,7 +1532,7 @@ function today(M) {
     let streak = 0; for (let i = N - 1; i >= 0 && m[i]; i--) streak++;
     const fires = keys.length && m[N - 1];
     const detail = keys.length ? keys.map(k => `${MK[k].tfName} ${MK[k].label}: ${fmtVal(k, F[k][N - 1])} ${condOk(F[k][N - 1], state[s.id][k]) ? '✓' : '✗'}`).join(' · ') : 'no conditions set';
-    return `<div class="badge ${kind} ${fires ? 'fire' : ''}"><div class="t">${chip(s.id)}${s.label} on ${d} close ($${D.close[N - 1].toFixed(2)})</div>` +
+    return `<div class="badge ${kind} ${fires ? 'fire' : ''}"><div class="t">${chip(s.id)}${s.label} · ${esc(slotName(s.id))} on ${d} close ($${D.close[N - 1].toFixed(2)})</div>` +
       `<div class="v">${fires ? s.label.toUpperCase() + ' signal' + (streak > 1 ? ` · day ${streak}` : '') : 'No signal'}</div><div class="r">${detail}</div></div>`;
   }).join('');
 }
@@ -1676,7 +1807,8 @@ function sugg() {
       `<div class="row" style="margin-top:8px">` + twin.map(t => `<button class="sm" data-load="${s.id}" data-into="${t}">Load into ${SL[t].label}</button>`).join('') + '</div>';
   });
   document.querySelectorAll('[data-load]').forEach(b => b.onclick = () => {
-    side = b.dataset.into; state[side] = condsToState(D.suggest[H][b.dataset.load].rule); drawTabs(); render();
+    side = b.dataset.into; state[side] = condsToState(D.suggest[H][b.dataset.load].rule);
+    setSlotName(side, `Optimizer ${SL[b.dataset.load].label.toLowerCase()} suggestion (${H}D)`); drawTabs(); render();
     window.scrollTo({top: 0, behavior: 'smooth'}); });
   [['buy1', 'singBuy'], ['sell1', 'singSell']].forEach(([s, id]) => {
     const rows = S[s].singles;
@@ -1728,11 +1860,77 @@ function hits(M) {
     }).join('') : `<tr><td colspan="${3 + D.fwdDays.length + keys.length}" class="note">No selected rule fired in this range.</td></tr>`);
 }
 
+// ---------- email alert setup (fixed: what the scheduled scanner emails about) ----------
+function alertSetup() {
+  const rf = D.rulesFile, srcTxt = {auto: 'optimizer suggestion', settings: 'script settings', saved: 'rules file'};
+  $('alertPill').textContent = rf.found ? `${rf.file}${rf.exported ? ' · exported ' + fmtDate(rf.exported.slice(0, 10)) : ''}` : 'no rules file';
+  $('alertFile').innerHTML = rf.found ? '' : `<div class="warn">No <code>${esc(rf.file)}</code> was found next to the script on the last
+    build, so the emails use the script settings or optimizer suggestions below. Export your rules from this page, name the file exactly
+    <code>${esc(rf.file)}</code> and commit it in the same folder as <code>mtf_signal_scanner.py</code>.</div>`;
+  $('alertSet').innerHTML = `<tr><th>Slot</th><th>Template</th><th>Source</th><th>Conditions</th><th>Latest close</th><th>Editor</th></tr>` +
+    SLOTS.map(s => {
+      const keys = keysOf(ALERT[s.id]), m = ALERT_M[s.id];
+      let streak = 0; for (let i = N - 1; i >= 0 && m[i]; i--) streak++;
+      const status = !keys.length ? '<span class="hint">off (no alerts)</span>' : m[N - 1]
+        ? `<b style="color:${s.dir > 0 ? '#0b5a24' : '#8e1b1b'}">FIRES${streak > 1 ? ` · day ${streak}` : ''}</b>` : 'no signal';
+      const same = canon(toPy(s.id)) === canon(toPyOf(ALERT[s.id]));
+      return `<tr><td>${chip(s.id)} ${s.label}</td><td class="tname">${esc(D.rules[s.id].name)}</td>` +
+        `<td class="hint">${srcTxt[D.rules[s.id].source]}</td><td class="wrapcell hint">${esc(descOf(ALERT[s.id]))}</td><td>${status}</td>` +
+        `<td>${same ? '<span class="same">same</span>' : `<span class="diff">edited: ${esc(slotName(s.id))}</span> <button class="sm" data-reset="${s.id}">reset</button>`}</td></tr>`;
+    }).join('');
+  $('alertSet').querySelectorAll('[data-reset]').forEach(b => b.onclick = () => resetSlot(b.dataset.reset));
+  const prev = sget(KEY_PREV), differs = prev && prev.rules && SLOTS.some(s => canon(prev.rules[s.id] || {}) !== canon(toPy(s.id)));
+  $('draftRow').innerHTML = differs ? `<span class="hint">You had unsaved edits from an earlier visit (${SLOTS.map(s => `${s.label}: ${esc((prev.names || {})[s.id] || 'custom')}`).join(' · ')}).</span>
+    <button class="sm" id="restoreDraft">Restore those edits</button> <button class="sm" id="dropDraft">Discard</button>` : '';
+  if (differs) {
+    $('restoreDraft').onclick = () => { SLOTS.forEach(s => { state[s.id] = fromPy(prev.rules[s.id] || {});
+      setSlotName(s.id, (prev.names || {})[s.id] || null); }); try { STORE && STORE.removeItem(KEY_PREV); } catch (e) {} render(); };
+    $('dropDraft').onclick = () => { try { STORE && STORE.removeItem(KEY_PREV); } catch (e) {} render(); };
+  }
+}
+function resetSlot(s) { state[s] = condsToState(D.rules[s].conds); setSlotName(s, D.rules[s].name); render(); }
+
+// ---------- download: every chart hit for the four loaded slots, all indicators ----------
+function streakRuns(m) { const r = new Array(N).fill(0); for (let i = 0; i < N; i++) r[i] = m[i] ? (i > 0 ? r[i - 1] : 0) + 1 : 0; return r; }
+function csvCell(v) { if (v === null || v === undefined) return ''; const t = String(v); return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t; }
+function hitsCsv() {
+  const M = Object.fromEntries(SLOTS.map(s => [s.id, ruleKeys(s.id).length ? mask(s.id) : new Array(N).fill(false)]));
+  const R = Object.fromEntries(SLOTS.map(s => [s.id, streakRuns(M[s.id])]));
+  const col = s => s.label.replace(/\s+/g, '');            // "Buy1", "Sell2"
+  const keys = D.meta.map(m => m.k), used = Object.fromEntries(SLOTS.map(s => [s.id, new Set(ruleKeys(s.id))]));
+  const head = ['Date', 'Close', 'Signals', ...SLOTS.flatMap(s => [`${col(s)}_Signal`, `${col(s)}_StreakDay`, `${col(s)}_Template`]),
+    ...D.fwdDays.map(n => `Fwd_${n}D%`), 'Period', 'Fields_In_Fired_Rules', ...keys];
+  const rows = [head.join(',')];
+  let n = 0;
+  for (let i = RA; i <= RB; i++) {
+    const fired = SLOTS.filter(s => M[s.id][i]);
+    if (!fired.length) continue;
+    n++;
+    const inRules = [...new Set(fired.flatMap(s => [...used[s.id]]))].join(' ');
+    rows.push([D.dates[i], D.close[i], fired.map(s => `${s.label} [${slotName(s.id)}]`).join('; '),
+      ...SLOTS.flatMap(s => [M[s.id][i] ? 1 : 0, R[s.id][i] || '', M[s.id][i] ? slotName(s.id) : '']),
+      ...D.fwdDays.map(h => D.fwd[String(h)][i]),
+      i < D.optStart ? 'before_optimizer' : i < D.split ? 'train' : 'test', inRules,
+      ...keys.map(k => F[k][i])].map(csvCell).join(','));
+  }
+  if (!n) { note('No loaded rule fired in the selected date range, so there is nothing to download.'); return; }
+  download(`${D.ticker}_signal_hits_${D.dates[RA]}_to_${D.dates[RB]}.csv`, rows.join('\n'), 'text/csv');
+  note(`<span class="ok-msg">Downloaded ${n.toLocaleString()} signal days</span> (${fmtDate(D.dates[RA])} to ${fmtDate(D.dates[RB])}) for ` +
+    SLOTS.filter(s => ruleKeys(s.id).length).map(s => `${s.label} = ${esc(slotName(s.id))}`).join(', ') +
+    '. Forward returns are blank where the window has not closed yet.');
+}
+function hitsRules() {
+  download(`${D.ticker}_signal_hits_rules_${D.dates[RA]}_to_${D.dates[RB]}.json`, JSON.stringify({
+    ticker: D.ticker, range: [D.dates[RA], D.dates[RB]], exported: new Date().toISOString(),
+    slots: Object.fromEntries(SLOTS.map(s => [s.id, {label: s.label, template: slotName(s.id), conditions: ruleDesc(s.id), rule: toPy(s.id),
+      emailRule: D.rules[s.id].name, sameAsEmailRule: canon(toPy(s.id)) === canon(toPyOf(ALERT[s.id]))}]))}, null, 2));
+}
+
 // ---------- render ----------
 function render() {
   const M = Object.fromEntries(SLOTS.map(s => [s.id, mask(s.id)]));
   const ST = Object.fromEntries(SLOTS.map(s => [s.id, statsOf(M[s.id], H)]));
-  fillGrid(); results(ST); today(M); chart(ST, M); trips(M); heat(); sugg(); hitControls(); hits(M);
+  drawTabs(); alertSetup(); fillGrid(); results(ST); today(M); chart(ST, M); trips(M); heat(); sugg(); hitControls(); hits(M);
   autosave();
 }
 function postHeight() {
@@ -1743,13 +1941,16 @@ function postHeight() {
   $('horizon').innerHTML = D.fwdDays.map(n => `<option value="${n}">${hName(n)}</option>`).join('');
   $('from').min = $('to').min = D.dates[0]; $('from').max = $('to').max = D.dates[N - 1];
   periodOptions();
-  SLOTS.forEach(s => state[s.id] = condsToState(D.rules[s.id].conds));
+  // Always open on the rules the scanner emails about (the rules file from the last build)
+  SLOTS.forEach(s => { state[s.id] = condsToState(D.rules[s.id].conds); setSlotName(s.id, D.rules[s.id].name); });
   const pairOpts = PAIRS.map(p => `<option value="${p.id}">${p.label}</option>`).join('');
   $('tripPair').innerHTML = $('chartPair').innerHTML = pairOpts;
 
+  // Restore view settings from the last visit, but not its rules: if they differed from the
+  // email rules, keep them aside so "Restore those edits" can bring them back.
   const saved = sget(KEY_CUR);
   if (saved && saved.rules) {
-    SLOTS.forEach(s => { if (saved.rules[s.id]) state[s.id] = fromPy(saved.rules[s.id]); });
+    if (SLOTS.some(s => canon(saved.rules[s.id] || {}) !== canon(toPy(s.id)))) sset(KEY_PREV, {rules: saved.rules, names: saved.names || {}});
     if (saved.H && D.fwdDays.map(String).includes(String(saved.H))) H = String(saved.H);
     if (saved.period && [...$('period').options].some(o => o.value === saved.period)) $('period').value = saved.period;
     if (saved.period === 'custom') { $('from').value = saved.from || ''; $('to').value = saved.to || ''; }
@@ -1758,9 +1959,11 @@ function postHeight() {
   $('horizon').value = H;
   applyPeriod(); drawTabs(); drawGrid(); drawLib(); baseNote();
 
-  $('resetBtn').onclick = () => { state[side] = condsToState(D.rules[side].conds); render(); };
-  $('suggestBtn').onclick = () => { state[side] = condsToState(D.suggest[H][side].rule); render(); };
-  $('clearBtn').onclick = () => { state[side] = {}; render(); };
+  $('resetBtn').onclick = () => resetSlot(side);
+  $('suggestBtn').onclick = () => { state[side] = condsToState(D.suggest[H][side].rule); setSlotName(side, `Optimizer suggestion (${H}D)`); render(); };
+  $('clearBtn').onclick = () => { state[side] = {}; setSlotName(side, null); render(); };
+  ['hitsCsvBtn', 'hitsCsvBtn2'].forEach(id => $(id).onclick = hitsCsv);
+  $('hitsRulesBtn').onclick = hitsRules;
   $('horizon').onchange = () => { H = $('horizon').value; render(); };
   $('period').onchange = () => { applyPeriod(); render(); };
   ['from', 'to'].forEach(id => $(id).addEventListener('change', () => { $('period').value = 'custom'; applyPeriod(); render(); }));
@@ -1773,17 +1976,19 @@ function postHeight() {
     const kind = SL[side].dir > 0 ? 'buy' : 'sell', j = library.findIndex(r => r.name === name && r.kind === kind);
     const rec = {name, kind, rule: toPy(side), ticker: D.ticker, saved: new Date().toISOString().slice(0, 10)};
     if (j >= 0) library[j] = rec; else library.push(rec);
+    setSlotName(side, name);
     const ok = sset(KEY_LIB, library); drawLib(); $('libSel').value = String(j >= 0 ? j : library.length - 1); $('saveName').value = '';
     note(ok ? `<span class="ok-msg">Saved “${esc(name)}”.</span> Load it into any slot, for any ticker. Use Export to keep a file copy.`
       : `Saved for this page visit only (browser storage is blocked). Use <b>Export rules</b> to keep it.`);
   };
   $('libLoad').onclick = () => { const r = library[+$('libSel').value]; if (!r) return;
-    state[side] = fromPy(r.rule); render(); note(`<span class="ok-msg">Loaded “${esc(r.name)}” into ${SL[side].label}.</span>`); };
+    state[side] = fromPy(r.rule); setSlotName(side, r.name); render(); note(`<span class="ok-msg">Loaded “${esc(r.name)}” into ${SL[side].label}.</span>`); };
   $('libDel').onclick = () => { const j = +$('libSel').value, r = library[j]; if (!r || !confirm(`Delete saved rule “${r.name}”?`)) return;
     library.splice(j, 1); sset(KEY_LIB, library); drawLib(); baseNote(); };
   $('exportBtn').onclick = () => {
     download(`mtf_signal_rules_${D.ticker}.json`, JSON.stringify({ticker: D.ticker, saved: new Date().toISOString(), horizon: Number(H),
-      rules: Object.fromEntries(SLOTS.map(s => [s.id, toPy(s.id)])), library}, null, 2));
+      rules: Object.fromEntries(SLOTS.map(s => [s.id, toPy(s.id)])),
+      names: Object.fromEntries(SLOTS.map(s => [s.id, slotName(s.id)])), library}, null, 2));
     note(`<span class="ok-msg">Downloaded mtf_signal_rules_${esc(D.ticker)}.json.</span> Put it next to mtf_signal_scanner.py and the next run
       uses these four rules for alerts and as the report's starting rules (an empty slot = no alerts for it).`);
   };
@@ -1792,8 +1997,9 @@ function postHeight() {
     const f = $('importFile').files[0]; if (!f) return;
     try {
       const o = JSON.parse(await f.text());
-      SLOTS.forEach(s => { if (o.rules && o.rules[s.id]) state[s.id] = fromPy(o.rules[s.id]); });
       (o.library || []).forEach(r => { if (!library.some(x => x.name === r.name && x.kind === r.kind)) library.push(r); });
+      SLOTS.forEach(s => { if (o.rules && o.rules[s.id]) { state[s.id] = fromPy(o.rules[s.id]);
+        setSlotName(s.id, (o.names || {})[s.id] || libraryName(toPy(s.id), kindOf(s.id), o.library || library)); } });
       sset(KEY_LIB, library); drawLib(); render();
       note(`<span class="ok-msg">Imported ${esc(f.name)}.</span>`);
     } catch (e) { note(`Couldn't read ${esc(f.name)}: ${esc(e.message)}`); }
@@ -1850,7 +2056,7 @@ def main():
     build_report(win, opt_start, split_date, suggest, rules)
     st = latest_status(win, rules)
     for slot, lab, *_ in SLOTS:
-        print(f"Latest close {win.index[-1]:%Y-%m-%d}: {lab.upper()} rule "
+        print(f"Latest close {win.index[-1]:%Y-%m-%d}: {lab.upper()} [{rules[slot]['name']}] "
               f"{'FIRES' if st[slot]['fires'] else 'no signal'} ({rules[slot]['source']}: {rules[slot]['text']})")
     print(f"Report: {HTML_OUT}\nCSV:    {CSV_OUT}")
 

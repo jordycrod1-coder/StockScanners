@@ -1157,6 +1157,8 @@ Forward horizons are in trading days (about 21 per month). Everything below foll
     <label class="ctl">from <input type="date" id="from"></label>
     <label class="ctl">to <input type="date" id="to"></label>
     <span class="pill" id="rangePill"></span>
+    <span class="pill" id="latestPill"></span>
+    <button class="sm" id="jumpLatest" style="display:none">Jump to latest close</button>
   </div>
   <div class="row" style="margin-bottom:4px">
     <button id="resetBtn" title="The rule the scanner uses for email alerts">Reset to scanner rule</button>
@@ -1397,7 +1399,7 @@ let library = sget(KEY_LIB) || [];
 function autosave() {
   sset(KEY_CUR, {rules: Object.fromEntries(SLOTS.map(s => [s.id, toPy(s.id)])),
     names: Object.fromEntries(SLOTS.map(s => [s.id, slotName(s.id)])), H, period: $('period').value,
-    from: $('from').value, to: $('to').value, side});
+    from: $('from').value, to: $('to').value, lastDate: D.dates[N - 1], side});
 }
 function note(msg) { $('saveNote').innerHTML = msg; }
 function baseNote() {
@@ -1450,6 +1452,10 @@ function applyPeriod() {
   }
   $('from').value = D.dates[RA]; $('to').value = D.dates[RB];
   $('rangePill').textContent = `${fmtDate(D.dates[RA])} → ${fmtDate(D.dates[RB])} · ${(RB - RA + 1).toLocaleString()} trading days`;
+  $('latestPill').textContent = `latest close: ${fmtDate(D.dates[N - 1])}`;
+  const behind = N - 1 - RB;
+  $('jumpLatest').style.display = behind > 0 ? '' : 'none';
+  $('jumpLatest').textContent = `Jump to latest close (${behind} newer day${behind > 1 ? 's' : ''} hidden)`;
 }
 
 // ---------- rule grid ----------
@@ -1953,7 +1959,18 @@ function postHeight() {
     if (SLOTS.some(s => canon(saved.rules[s.id] || {}) !== canon(toPy(s.id)))) sset(KEY_PREV, {rules: saved.rules, names: saved.names || {}});
     if (saved.H && D.fwdDays.map(String).includes(String(saved.H))) H = String(saved.H);
     if (saved.period && [...$('period').options].some(o => o.value === saved.period)) $('period').value = saved.period;
-    if (saved.period === 'custom') { $('from').value = saved.from || ''; $('to').value = saved.to || ''; }
+    if (saved.period === 'custom') {
+      if (!saved.lastDate) {
+        // Saved by an older page that froze the end date: go back to the default rolling window.
+        $('period').value = `${D.viewYears}y`;
+        if ($('period').value !== `${D.viewYears}y`) $('period').value = 'all';
+      } else {
+        // If the range ended on the newest close at the time, keep it ending on the newest close now.
+        // An end date you picked earlier than that (to study a past period) is kept as is.
+        $('from').value = saved.from || '';
+        $('to').value = saved.to && saved.to < saved.lastDate ? saved.to : '';
+      }
+    }
     if (saved.side && SL[saved.side]) side = saved.side;
   }
   $('horizon').value = H;
@@ -1966,6 +1983,9 @@ function postHeight() {
   $('hitsRulesBtn').onclick = hitsRules;
   $('horizon').onchange = () => { H = $('horizon').value; render(); };
   $('period').onchange = () => { applyPeriod(); render(); };
+  $('jumpLatest').onclick = () => { $('to').value = D.dates[N - 1];
+    if ($('period').value !== 'custom' && $('period').value !== 'train') { applyPeriod(); render(); return; }
+    $('period').value = 'custom'; applyPeriod(); render(); };
   ['from', 'to'].forEach(id => $(id).addEventListener('change', () => { $('period').value = 'custom'; applyPeriod(); render(); }));
   ['heatCtx', 'logY', 'showTrips', 'chartPair', 'fullHover'].forEach(id => $(id).addEventListener('change', render));
   $('tripPair').onchange = () => { $('chartPair').value = $('tripPair').value; render(); };

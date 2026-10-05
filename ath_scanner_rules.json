@@ -1,0 +1,21 @@
+{
+  "confirm": {
+    "window_days": 30,
+    "min_ath_days": 2,
+    "max_days_since_ath": 5,
+    "max_pct_below_ath": 5.0,
+    "hold_above_breakout": true
+  },
+  "filters": {
+    "rsi_min": null,
+    "rsi_max": null,
+    "rvol_min": null,
+    "ret_min": null,
+    "macd": "any",
+    "stoch": "any"
+  },
+  "email": {
+    "send_when": "changes",
+    "list_running": true
+  }
+}

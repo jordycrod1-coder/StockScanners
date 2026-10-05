@@ -614,6 +614,8 @@ def write_csv(cal, s0, prep, states, rules):
 def build_report(cal, s0, prep, rules, rules_exists):
     from plotly.offline import get_plotlyjs, get_plotlyjs_version
 
+    OUT_DIR.mkdir(parents=True, exist_ok=True)   # site/scanners/... doesn't exist on a fresh runner
+
     # only tickers that made at least one new ATH close in the calendar matter here
     states = {t: compute_states(s, rules["confirm"]) for t, s in prep.items()}
     keep = sorted(t for t in prep if any(states[t]["ath"]))

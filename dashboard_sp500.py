@@ -60,6 +60,20 @@ OUTPUT_DIR = os.environ.get("DASHBOARD_OUTPUT_DIR", "site")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 GENERATED_IMAGES = []  # [(filename, title), ...] in the order charts are saved
 
+# GitHub Actions runners use UTC, so "server time" was 5 hours ahead of
+# Central. All human-facing timestamps now use US Central (America/Chicago
+# switches CDT/CST automatically, and %Z prints the right one).
+DISPLAY_TZ = pytz.timezone("America/Chicago")
+
+
+def now_central():
+    return datetime.now(pytz.utc).astimezone(DISPLAY_TZ)
+
+
+def fmt_central(dt):
+    """e.g. 'Oct 6, 2026 7:01 PM CDT'"""
+    return dt.strftime("%b %-d, %Y %-I:%M %p %Z")
+
 
 def save_current_figure(fig_obj, filename, title):
     """Save fig_obj to OUTPUT_DIR/filename, close it, and register it for index.html."""
@@ -281,6 +295,13 @@ vix3m = clean_download(VIX3M_TICKER, MARKET_HISTORY)
 
 if spy is None:
     raise RuntimeError("SPY data could not be downloaded.")
+
+# Most recent trading day Yahoo actually returned for SPY. Shown in the page
+# title and chart banners so you can confirm at a glance that the data is
+# current (e.g. "Data as of Mon Oct 5, 2026").
+DATA_AS_OF = pd.Timestamp(spy["Close"].dropna().index.max())
+DATA_AS_OF_LABEL = DATA_AS_OF.strftime("%a %b %-d, %Y")
+print(f"Latest SPY daily bar: {DATA_AS_OF.date()}")
 
 cross_asset_tickers = {
     "10Y": "^TNX",
@@ -999,7 +1020,7 @@ gs_ds = gridspec.GridSpec(
 ax_overall = fig_ds.add_subplot(gs_ds[0, :])
 ax_overall.axis("off")
 ax_overall.set_facecolor(STATUS_BG[overall_status])
-ax_overall.text(0.015, 0.72, "OVERALL MARKET STATUS", fontsize=13, fontweight="bold",
+ax_overall.text(0.015, 0.72, f"OVERALL MARKET STATUS  ·  DATA AS OF {DATA_AS_OF_LABEL.upper()}", fontsize=13, fontweight="bold",
                  color="#666666", transform=ax_overall.transAxes, va="center")
 ax_overall.text(0.015, 0.30,
                  f"{regime_label}  ({STATUS_WORD[overall_status]})   |   Score {regime_score:+d} / 10",
@@ -1195,15 +1216,18 @@ N_ROWS = 1 + N_STACK_TOTAL + 9 + 1  # 1 banner + 23 stacked charts + 9 panel row
 # Single column now (no more side-by-side split) — narrower figure width so
 # the one continuous vertical line of charts reads as centered rather than
 # stretched full-bleed edge to edge. Width trimmed to 70% of the prior 20in.
-fig = plt.figure(figsize=(14, 148))
+fig = plt.figure(figsize=(14, 154))
 gs = gridspec.GridSpec(
     N_ROWS,
     4,
     height_ratios=(
         [1.1]  # 0 banner
-        + [1.35, 1.35, 1.35, 2.0]  # 1-4 Monthly (bottom panel taller — shows date labels)
-        + [1.35, 1.35, 1.35, 2.0]  # 5-8 Weekly (bottom panel taller — shows date labels)
-        + [1.35] * (N_DAILY_ROWS - 1) + [2.0]  # 9-23 Daily merged (15 rows; only the very last is taller)
+        # Every time-series panel now shows its own date labels, so all
+        # stacked rows are the same height (previously only the bottom row
+        # of each block was taller to make room for dates).
+        + [1.5] * N_MONTHLY_ROWS  # 1-4 Monthly
+        + [1.5] * N_WEEKLY_ROWS  # 5-8 Weekly
+        + [1.5] * N_DAILY_ROWS  # 9-23 Daily merged (15 rows)
         + [2.6, 3.2, 2.6, 4.2, 10.0, 10.0, 10.0, 12.0, 4.2, 10.5]  # 24-33 everything else (33 = new sector regime banner grid, 6 rows tall)
     ),
     hspace=0.32,
@@ -1227,7 +1251,7 @@ ax.axis("off")
 ax.text(
     0.01,
     0.86,
-    "S&P 500 PROFESSIONAL MARKET & SECTOR ROTATION DASHBOARD",
+    f"S&P 500 PROFESSIONAL MARKET & SECTOR ROTATION DASHBOARD  ·  DATA AS OF {DATA_AS_OF_LABEL.upper()}",
     fontsize=13,
     fontweight="bold",
     color="#888888",
@@ -1277,7 +1301,19 @@ def fetch_spy_panel_data(period, interval):
     df = calculate_stochastic(df)
     df["MFI"] = calculate_mfi(df)
     df["CMF"] = calculate_cmf(df)
-    return df.dropna()
+    # FIX (missing latest day): this used to be df.dropna(), which drops ANY
+    # row with a NaN in ANY column. Yahoo often returns the newest bar with a
+    # blank Open/High/Low/Volume for a while after the close, so the most
+    # recent trading day was silently deleted here -- and because the whole
+    # Daily group's x-range is set from this frame, it was clipped from all
+    # 15 daily charts too. Now: keep every row that has a Close, and only
+    # trim the indicator warm-up rows at the START of the series.
+    df = df.dropna(subset=["Close"])
+    warm = [df[c].first_valid_index() for c in ("MACD", "RSI", "%K", "MFI", "CMF")]
+    warm = [w for w in warm if w is not None]
+    if warm:
+        df = df.loc[max(warm):]
+    return df
 
 
 # Monthly and Weekly only need their own SPY fetch; Daily reuses this too,
@@ -1327,7 +1363,14 @@ def plot_spy_4panel_block(df_tf, tf, row_start, shared_ref=None, apply_label_hid
     ]
     ax_p2.bar(x_num, y_vol, width=SPY_PANEL_BAR_WIDTH_MAP.get(interval, 0.5), color=vol_colors, alpha=0.25)
     ax_p2.set_yticks([])
-    ax_p.set_title(f"SPY {tf} Price & Volume", fontweight="bold", loc="left")
+    # Yahoo stamps weekly bars with the week's Monday and monthly bars with the
+    # 1st of the month, so word the label accordingly.
+    _last = df_tf.index.max()
+    _last_txt = {
+        "1mo": f"{_last:%b %Y}",
+        "1wk": f"week of {_last:%a %b %-d, %Y}",
+    }.get(interval, f"{_last:%a %b %-d, %Y}")
+    ax_p.set_title(f"SPY {tf} Price & Volume  (latest bar: {_last_txt})", fontweight="bold", loc="left")
     block_axes.append(ax_p)
 
     ref = shared_ref if shared_ref is not None else ax_p
@@ -1387,10 +1430,12 @@ def plot_spy_4panel_block(df_tf, tf, row_start, shared_ref=None, apply_label_hid
     for a in block_axes:
         a.xaxis.set_major_formatter(spy_date_fmt)
 
+    # Date labels on EVERY panel (not just the bottom one of the block), so
+    # each chart can be read on its own without scrolling down to find dates.
     if apply_label_hiding:
-        for a in block_axes[:-1]:
-            plt.setp(a.get_xticklabels(), visible=False)
-        plt.setp(block_axes[-1].get_xticklabels(), rotation=45, ha="right", fontsize=7)
+        for a in block_axes:
+            a.tick_params(axis="x", labelbottom=True)
+            plt.setp(a.get_xticklabels(), visible=True, rotation=45, ha="right", fontsize=7)
 
     return block_axes, ax_p
 
@@ -1554,17 +1599,27 @@ ax_mcc.grid(alpha=0.3)
 
 # Lock the whole merged Daily group (4 new + 11 original = 15 panels) to the
 # same x-range, put a tick on EVERY month (interval=1) instead of
-# matplotlib's automatic locator skipping to every other month, hide tick
-# LABELS on all but the very bottom chart of the group, and rotate those.
+# matplotlib's automatic locator skipping to every other month, and show
+# date labels on EVERY chart of the group (not just the bottom one).
 all_daily_axes = daily_new_axes + stack_axes
-if daily_ref_ax is not None and daily_df_for_range is not None and not daily_df_for_range.empty:
-    daily_ref_ax.set_xlim(daily_df_for_range.index.min(), daily_df_for_range.index.max())
+# x-range: right edge = the newest date in ANY daily source (the SPY panel
+# frame or the main 3y SPY download), plus a 3-day pad so the latest bar
+# isn't sitting half-hidden on the border. Previously the right edge came
+# only from the SPY panel frame, so a day dropped there was clipped from
+# all 15 daily charts.
+if all_daily_axes:
+    _x_ref = daily_ref_ax if daily_ref_ax is not None else all_daily_axes[0]
+    _x_end = DATA_AS_OF
+    _x_start = spy.index[-TIMESERIES_LOOKBACK_DAYS] if len(spy) > TIMESERIES_LOOKBACK_DAYS else spy.index.min()
+    if daily_df_for_range is not None and not daily_df_for_range.empty:
+        _x_end = max(_x_end, daily_df_for_range.index.max())
+        _x_start = min(_x_start, daily_df_for_range.index.min())
+    _x_ref.set_xlim(_x_start, _x_end + pd.Timedelta(days=3))
 for a in all_daily_axes:
     a.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
     a.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%Y"))
-for a in all_daily_axes[:-1]:
-    plt.setp(a.get_xticklabels(), visible=False)
-plt.setp(all_daily_axes[-1].get_xticklabels(), rotation=45, ha="right")
+    a.tick_params(axis="x", labelbottom=True)
+    plt.setp(a.get_xticklabels(), visible=True, rotation=45, ha="right", fontsize=7)
 
 # ============================================================
 # ROW 24 — MOMENTUM / RISK CONTEXT / BREADTH MOMENTUM (categorical, not time-axis)
@@ -1959,7 +2014,7 @@ row21_gs = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=gs[31, :], width_
 # --- Left: 8 cross-asset daily trend charts, stacked vertically (one per
 # row) instead of a cramped 2x4 grid — full width per chart, shared x-axis,
 # date labels only on the bottom chart. ---
-cross_chart_gs = gridspec.GridSpecFromSubplotSpec(8, 1, subplot_spec=row21_gs[0, 0], hspace=0.5)
+cross_chart_gs = gridspec.GridSpecFromSubplotSpec(8, 1, subplot_spec=row21_gs[0, 0], hspace=0.75)
 
 CROSS_ASSET_ORDER = ["10Y", "3M T-Bill", "DXY", "Oil", "Gold", "HYG", "LQD", "PutCall"]
 CROSS_ASSET_VALUE_FMT = {
@@ -2003,13 +2058,15 @@ for idx, name in enumerate(CROSS_ASSET_ORDER):
 
     cross_asset_axes.append(ax_ca)
 
-for a in cross_asset_axes[:-1]:
-    plt.setp(a.get_xticklabels(), visible=False)
-if cross_asset_axes:
-    plt.setp(cross_asset_axes[-1].get_xticklabels(), rotation=45, ha="right", fontsize=7)
+# Date labels on every cross-asset chart. These panels are short, so use a
+# compact single-line "Oct '26" label with no rotation to save space.
+for a in cross_asset_axes:
+    a.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+    a.tick_params(axis="x", labelbottom=True)
+    plt.setp(a.get_xticklabels(), visible=True, rotation=0, ha="center", fontsize=7)
 
 if cross_asset_axes:
-    cross_asset_axes[0].set_xlim(spy_overlay.index.min(), spy_overlay.index.max())
+    cross_asset_axes[0].set_xlim(spy_overlay.index.min(), DATA_AS_OF + pd.Timedelta(days=3))
 
 print("Cross-asset data availability (rows fetched, most-recent date):")
 for name in CROSS_ASSET_ORDER:
@@ -2162,7 +2219,7 @@ fig.text(
     0.01,
     0.001,
     "Data: Yahoo Finance + current S&P 500 constituent list | "
-    f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} | "
+    f"Data as of {DATA_AS_OF_LABEL} | Generated {fmt_central(now_central())} | "
     "Technical/market-regime framework only — not investment advice.",
     fontsize=8,
     color="#777777",
@@ -2750,7 +2807,7 @@ generate_sector_indicator_grid()
 # the Pages site on every run, so this file (and the images beside it)
 # are what's live at the Pages URL after each scheduled refresh.
 
-_generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+_generated_at = fmt_central(now_central())  # e.g. "Oct 6, 2026 7:01 PM CDT"
 
 _cards_html = "\n".join(
     f"""    <section class="card">
@@ -2799,7 +2856,7 @@ _page_html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>S&amp;P 500 Market + Sector Rotation Dashboard</title>
+<title>Investment Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body {{
@@ -2828,11 +2885,8 @@ _page_html = f"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-  <h1>S&amp;P 500 Market + Sector Rotation Dashboard</h1>
-  <div class="meta">
-    Last updated {_generated_at} (server time) &middot;
-    regenerated automatically after each scheduled GitHub Actions run.
-  </div>
+  <h1>Investment Dashboard &middot; Data as of {DATA_AS_OF_LABEL}</h1>
+  <div class="meta">Updated {_generated_at}</div>
 {_cards_html}
 {_scanners_html}
 <script>

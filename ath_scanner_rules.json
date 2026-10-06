@@ -1,10 +1,66 @@
 {
-  "confirm": {
-    "window_days": 30,
-    "min_ath_days": 2,
-    "max_days_since_ath": 5,
-    "max_pct_below_ath": 5.0,
-    "hold_above_breakout": true
+  "window_days": 30,
+  "entry": {
+    "count": {
+      "on": true,
+      "join": "and",
+      "n": 3
+    },
+    "recent": {
+      "on": true,
+      "join": "and",
+      "n": 5
+    },
+    "near": {
+      "on": true,
+      "join": "and",
+      "x": 5.0,
+      "unit": "pct"
+    },
+    "breakout": {
+      "on": true,
+      "join": "and",
+      "x": 1.0,
+      "unit": "pct",
+      "n": 1
+    },
+    "stoch": {
+      "on": false,
+      "join": "and",
+      "op": "ge",
+      "x": 50.0
+    }
+  },
+  "exit": {
+    "drawdown": {
+      "on": true,
+      "join": "or",
+      "x": 3.0,
+      "unit": "atr"
+    },
+    "stale": {
+      "on": true,
+      "join": "or",
+      "n": 15
+    },
+    "breakout": {
+      "on": true,
+      "join": "or",
+      "x": 1.0,
+      "unit": "pct",
+      "n": 1
+    },
+    "count": {
+      "on": false,
+      "join": "or",
+      "n": 1
+    },
+    "stoch": {
+      "on": false,
+      "join": "or",
+      "op": "le",
+      "x": 50.0
+    }
   },
   "filters": {
     "rsi_min": null,

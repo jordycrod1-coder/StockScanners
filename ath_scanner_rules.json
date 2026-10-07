@@ -4,23 +4,23 @@
     "count": {
       "on": true,
       "join": "and",
-      "n": 3
+      "n": 2
     },
     "recent": {
       "on": true,
       "join": "and",
-      "n": 5
+      "n": 10
     },
     "near": {
       "on": true,
       "join": "and",
-      "x": 5.0,
+      "x": 8,
       "unit": "pct"
     },
     "breakout": {
       "on": true,
       "join": "and",
-      "x": 1.0,
+      "x": 1,
       "unit": "pct",
       "n": 1
     },
@@ -28,14 +28,14 @@
       "on": false,
       "join": "and",
       "op": "ge",
-      "x": 50.0
+      "x": 50
     }
   },
   "exit": {
     "drawdown": {
       "on": true,
       "join": "or",
-      "x": 3.0,
+      "x": 3,
       "unit": "atr"
     },
     "stale": {
@@ -46,7 +46,7 @@
     "breakout": {
       "on": true,
       "join": "or",
-      "x": 1.0,
+      "x": 1,
       "unit": "pct",
       "n": 1
     },
@@ -59,7 +59,7 @@
       "on": false,
       "join": "or",
       "op": "le",
-      "x": 50.0
+      "x": 50
     }
   },
   "filters": {

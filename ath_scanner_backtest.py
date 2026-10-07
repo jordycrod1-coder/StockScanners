@@ -758,18 +758,28 @@ def build_email(cal, prep, states, rules, a):
     L.append("")
 
     if rules["email"]["list_running"]:
-        L.append(f"STILL RUNNING ({len(running)})  ticker: new ATH closes in {K}D / % below ATH")
+        # Grouped by sector (most tickers first), each sector sorted by % gain since breakout.
+        # Breakout date = the run's first new ATH close; gain = close vs the frozen breakout level.
+        L.append(f"STILL RUNNING ({len(running)})")
         L.append("-" * 60)
         if not running:
             L.append("   none")
-        row = []
-        for t in running:
-            row.append(f"{t}: {states[t]['cnt'][a]} / {_pct(states[t]['below'][a], 1, False)}")
-            if len(row) == 3:
-                L.append("   " + "    ".join(row))
-                row = []
-        if row:
-            L.append("   " + "    ".join(row))
+        else:
+            by_sec = {}
+            for t in running:
+                by_sec.setdefault(prep[t]["sector"], []).append(t)
+            sec_order = sorted(by_sec, key=lambda e: (-len(by_sec[e]), prep[by_sec[e][0]]["sectorName"]))
+            L.append(f"   {'Ticker':<7}{'Breakout':<13}{'Gain':>8}{f'ATH hits {K}D':>14}")
+            for etf in sec_order:
+                ts = by_sec[etf]
+                gains = {t: above_brk(prep[t], states[t], a) for t in ts}
+                ts.sort(key=lambda t: (gains[t] is None, -(gains[t] or 0), t))
+                L.append("")
+                L.append(f"{prep[ts[0]]['sectorName']} ({etf}) - {len(ts)}")
+                for t in ts:
+                    si = states[t]["start"][a]
+                    bd = "n/a" if si is None else f"{pd.Timestamp(cal[si]):%m-%d-%Y}"
+                    L.append(f"   {t:<7}{bd:<13}{_pct(gains[t]):>8}{states[t]['cnt'][a]:>14}")
         L.append("")
     L.append("=" * 60)
 
@@ -1479,10 +1489,24 @@ function emailText(a) {
   });
   L.push('');
   if (RULES.email.list_running) {
-    L.push(`STILL RUNNING (${ru.length})  ticker: new ATH closes in ${K}D / % below ATH`, dash);
+    L.push(`STILL RUNNING (${ru.length})`, dash);
     if (!ru.length) L.push('   none');
-    for (let k = 0; k < ru.length; k += 3)
-      L.push('   ' + ru.slice(k, k + 3).map(t => `${t}: ${ST[t].cnt[a]} / ${pyPct(ST[t].below[a], 1, false)}`).join('    '));
+    else {
+      const bySec = {}, secName = e => D.sectorName[e] || e;
+      ru.forEach(t => { (bySec[D.sector[t]] = bySec[D.sector[t]] || []).push(t); });
+      const order = Object.keys(bySec).sort((x, y) => bySec[y].length - bySec[x].length || (secName(x) < secName(y) ? -1 : secName(x) > secName(y) ? 1 : 0));
+      L.push('   ' + 'Ticker'.padEnd(7) + 'Breakout'.padEnd(13) + 'Gain'.padStart(8) + `ATH hits ${K}D`.padStart(14));
+      order.forEach(etf => {
+        const ts = bySec[etf], gn = {};
+        ts.forEach(t => { gn[t] = aboveBrk(S[t], ST[t], a); });
+        ts.sort((x, y) => (gn[x] === null) - (gn[y] === null) || (gn[y] || 0) - (gn[x] || 0) || (x < y ? -1 : 1));
+        L.push('', `${secName(etf)} (${etf}) - ${ts.length}`);
+        ts.forEach(t => {
+          const si = ST[t].start[a], d = si === null ? 'n/a' : D.dates[si].slice(5) + '-' + D.dates[si].slice(0, 4);
+          L.push('   ' + t.padEnd(7) + d.padEnd(13) + pyPct(gn[t]).padStart(8) + String(ST[t].cnt[a]).padStart(14));
+        });
+      });
+    }
     L.push('');
   }
   L.push(bar);

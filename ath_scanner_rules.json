@@ -41,7 +41,7 @@
     "stale": {
       "on": true,
       "join": "or",
-      "n": 15
+      "n": 9
     },
     "breakout": {
       "on": true,
@@ -71,7 +71,7 @@
     "stoch": "any"
   },
   "email": {
-    "send_when": "changes",
+    "send_when": "always",
     "list_running": true
   }
 }

@@ -2,9 +2,9 @@ name: Stock Scanners
 
 on:
   schedule:
-    - cron: '37 16 * * 1-5'   # 4:37 PM ET - primary run
+    - cron: '29 16 * * 1-5'   # 4:37 PM ET - primary run
       timezone: 'America/New_York'
-    - cron: '47 17 * * 1-5'   # 5:47 PM ET - backup (skips itself if the primary deployed)
+    - cron: '11 17 * * 1-5'   # 5:11 PM ET - backup (skips itself if the primary deployed)
       timezone: 'America/New_York'
   workflow_dispatch:
 

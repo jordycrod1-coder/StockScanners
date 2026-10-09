@@ -4,7 +4,7 @@ on:
   schedule:
     - cron: '37 16 * * 1-5'   # 4:37 PM ET - primary run
       timezone: 'America/New_York'
-    - cron: '47 17 * * 1-5'   # 5:47 PM ET - backup (skips itself if the primary succeeded)
+    - cron: '47 17 * * 1-5'   # 5:47 PM ET - backup (skips itself if the primary deployed)
       timezone: 'America/New_York'
   workflow_dispatch:
 
@@ -23,8 +23,12 @@ concurrency:
 
 jobs:
   # Decides whether this run should do anything.
-  # Manual runs always proceed; a scheduled run is skipped if a run
-  # already succeeded today.
+  # Manual runs always proceed. A scheduled run is skipped only if an
+  # earlier run AFTER today's market close actually deployed the dashboard.
+  #   - Runs from before 4:00 PM ET (e.g. a manual morning run) don't count,
+  #     so they no longer block the after-close update.
+  #   - Runs whose jobs were all skipped don't count either (GitHub marks
+  #     those "success" even though nothing was published).
   check:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -39,15 +43,23 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          today=$(TZ=America/New_York date +%F)
-          n=$(gh run list -R "$GITHUB_REPOSITORY" -w "${{ github.workflow }}" \
-                --status success --created ">=$today" --json databaseId -q 'length')
-          echo "Successful runs today: $n"
-          if [ "$n" -gt 0 ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+          since="$(TZ=America/New_York date +%F)T16:00:00$(TZ=America/New_York date +%:z)"
+          echo "Looking for deployed runs created since $since"
+          ids=$(gh run list -R "$GITHUB_REPOSITORY" -w "${{ github.workflow }}" \
+                  --status success --created ">=$since" \
+                  --json databaseId -q '.[].databaseId')
+          skip=false
+          for id in $ids; do
+            [ "$id" = "${{ github.run_id }}" ] && continue
+            deployed=$(gh run view "$id" -R "$GITHUB_REPOSITORY" --json jobs \
+                         -q '[.jobs[] | select(.name=="deploy-pages" and .conclusion=="success")] | length')
+            echo "Run $id deployed: $deployed"
+            if [ "$deployed" -gt 0 ]; then
+              skip=true
+              break
+            fi
+          done
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
 
   Scanner_All-Time-Highs:
     needs: check

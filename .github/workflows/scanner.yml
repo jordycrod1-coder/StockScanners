@@ -2,7 +2,7 @@ name: Stock Scanners
 
 on:
   schedule:
-    - cron: '29 16 * * 1-5'   # 4:37 PM ET - primary run
+    - cron: '29 16 * * 1-5'   # 4:29 PM ET - primary run
       timezone: 'America/New_York'
     - cron: '47 17 * * 1-5'   # 5:47 PM ET - backup (skips itself if the primary deployed)
       timezone: 'America/New_York'
@@ -29,11 +29,24 @@ jobs:
   #     so they no longer block the after-close update.
   #   - Runs whose jobs were all skipped don't count either (GitHub marks
   #     those "success" even though nothing was published).
+  #
+  # Scheduled runs then wait for TODAY's daily bar (data freshness gate):
+  #   - Yahoo can publish the day's daily bar a while after the 4:00 PM close.
+  #     Without this gate, a run that downloads too early builds everything on
+  #     the PREVIOUS day's bar, so the dashboard shows yesterday and the email
+  #     alerts fire a day late.
+  #   - The gate re-checks every 3 minutes (up to MAX_WAIT_MIN) until SPY and
+  #     the signal ticker both have a bar dated today, then lets the scanners run.
+  #   - If today's bar never shows up, the run fails instead of publishing stale
+  #     data (and instead of re-sending yesterday's alert). The 5:47 PM backup
+  #     then tries again.
+  #   - NYSE holidays: nothing new to publish, so the run is skipped (this also
+  #     stops a repeat of the previous day's alert email on holidays).
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 85
     outputs:
-      skip: ${{ steps.c.outputs.skip }}
+      skip: ${{ steps.c.outputs.skip == 'true' || steps.fresh.outputs.skip == 'true' }}
     steps:
       - id: c
         env:
@@ -60,6 +73,90 @@ jobs:
             fi
           done
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        if: github.event_name == 'schedule' && steps.c.outputs.skip != 'true'
+        with:
+          python-version: '3.11'
+
+      - name: Wait for today's daily bar (data freshness gate)
+        id: fresh
+        if: github.event_name == 'schedule' && steps.c.outputs.skip != 'true'
+        env:
+          SIGNAL_TICKER: TSLA
+          MAX_WAIT_MIN: '75'
+        run: |
+          pip install -q yfinance pandas pandas_market_calendars
+          python - <<'PY'
+          import os, sys, time
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          import pandas as pd
+          import pandas_market_calendars as mcal
+          import yfinance as yf
+
+          ET = ZoneInfo("America/New_York")
+          MAX_WAIT_MIN = int(os.environ.get("MAX_WAIT_MIN", "75"))
+          POLL_SEC = 180
+          # Same tickers and history lengths the scanners download, so this
+          # checks exactly the data they are about to use.
+          CHECKS = [("SPY", "3y"), (os.environ.get("SIGNAL_TICKER", "TSLA"), "max")]
+
+          def set_output(key, value):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"{key}={value}\n")
+
+          now = datetime.now(ET)
+          today = now.date()
+          print(f"Run started {now:%a %b %d, %Y %I:%M %p %Z}")
+
+          sched = mcal.get_calendar("NYSE").schedule(start_date=today, end_date=today)
+          if sched.empty:
+              print("NYSE is closed today (holiday). Nothing new to publish, so this run is skipped.")
+              set_output("skip", "true")
+              sys.exit(0)
+
+          close_et = sched.iloc[0]["market_close"].tz_convert(ET)
+          if now < close_et:
+              print(f"::error::This scheduled run started at {now:%I:%M %p %Z}, before today's close "
+                    f"({close_et:%I:%M %p %Z}). Check the schedule's timezone setting.")
+              sys.exit(1)
+
+          def latest_bar(ticker, period):
+              df = yf.download(ticker, period=period, interval="1d", auto_adjust=True, progress=False)
+              if df is None or df.empty:
+                  return None
+              idx = pd.DatetimeIndex(df.dropna(how="all").index)
+              if idx.tz is not None:
+                  idx = idx.tz_convert(ET).tz_localize(None)
+              return idx.max().date()
+
+          deadline = time.time() + MAX_WAIT_MIN * 60
+          attempt = 0
+          while True:
+              attempt += 1
+              stamp = datetime.now(ET).strftime("%I:%M %p %Z")
+              results = {}
+              for ticker, period in CHECKS:
+                  try:
+                      results[ticker] = latest_bar(ticker, period)
+                  except Exception as e:
+                      print(f"  {ticker}: download error ({e})")
+                      results[ticker] = None
+              shown = ", ".join(f"{t} {d or 'n/a'}" for t, d in results.items())
+              if all(d == today for d in results.values()):
+                  print(f"[{stamp}] check {attempt}: latest bars {shown} -> today's bar is in. Running scanners.")
+                  set_output("skip", "false")
+                  sys.exit(0)
+              if time.time() + POLL_SEC > deadline:
+                  print(f"::error::[{stamp}] Yahoo still has no bar for {today} after {MAX_WAIT_MIN} min "
+                        f"(latest: {shown}). Not publishing stale data; the backup run will try again.")
+                  sys.exit(1)
+              print(f"[{stamp}] check {attempt}: latest bars {shown}, waiting for {today}. "
+                    f"Re-checking in {POLL_SEC // 60} min...")
+              time.sleep(POLL_SEC)
+          PY
 
   Scanner_All-Time-Highs:
     needs: check

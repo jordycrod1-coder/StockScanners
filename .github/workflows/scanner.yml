@@ -1,95 +1,101 @@
 name: Stock Scanners
 
+# HOW THIS WORKFLOW DECIDES WHEN TO PUBLISH
+# ------------------------------------------------------------------------
+# Goal: one dashboard update + one set of alert emails per trading day, built
+# on THAT day's closing data, published as soon as Yahoo has posted it.
+#
+# GitHub's scheduler often starts runs late (sometimes hours) or skips a slot,
+# and Yahoo sometimes posts the daily bar late. So instead of betting on one
+# exact time, the workflow wakes up repeatedly, from 4:37 PM ET until just
+# before the next morning's open, and each wake-up asks:
+#
+#   1. Which trading session should be published now? (latest NYSE session
+#      that closed at least 30 minutes ago; holidays/early closes come from
+#      the official NYSE calendar)
+#   2. Is that session already on the dashboard? -> yes: stop (takes ~30 sec)
+#   3. Has Yahoo posted that session's bar for SPY, S&P 500 index, VIX, TSLA,
+#      and a few others? -> no: stop and let the next wake-up retry
+#   4. Otherwise: build the dashboard, check it really used that session's
+#      data, publish it, THEN send the alert emails.
+#
+# All times are America/New_York, so the switch between EDT and EST is
+# automatic (4:37 PM ET = 3:37 PM Central all year).
 on:
   schedule:
-    - cron: '29 16 * * 1-5'   # 4:29 PM ET - primary run
+    - cron: '37 16 * * 1-5'        # 4:37 PM ET (first try, 37 min after the close)
       timezone: 'America/New_York'
-    - cron: '47 17 * * 1-5'   # 5:47 PM ET - backup (skips itself if the primary deployed)
+    - cron: '7,37 17-19 * * 1-5'   # every 30 min, 5:07 PM - 7:37 PM ET
+      timezone: 'America/New_York'
+    - cron: '7 20-23 * * 1-5'      # hourly, 8:07 PM - 11:07 PM ET
+      timezone: 'America/New_York'
+    - cron: '7 0-9 * * 2-6'        # hourly overnight, 12:07 AM - 9:07 AM ET (8:07 AM Central), Tue-Sat
       timezone: 'America/New_York'
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Publish even if the latest session is not on Yahoo yet (uses whatever data is there)'
+        type: boolean
+        default: false
 
 # Needed so this workflow can publish to GitHub Pages.
-# actions: read lets the check job look up today's earlier runs.
+# actions: read lets the check job look up earlier runs.
 permissions:
   contents: read
   pages: write
   id-token: write
   actions: read
 
-# Only one Pages deployment at a time; don't cancel one that's mid-flight.
+# Only one run at a time; a queued wake-up waits for the current one.
 concurrency:
   group: "pages"
   cancel-in-progress: false
 
+env:
+  BUFFER_MIN: '30'                 # minutes after the close before trying
+  SIGNAL_TICKER: TSLA
+
 jobs:
-  # Decides whether this run should do anything.
-  # Manual runs always proceed. A scheduled run is skipped only if an
-  # earlier run AFTER today's market close actually deployed the dashboard.
-  #   - Runs from before 4:00 PM ET (e.g. a manual morning run) don't count,
-  #     so they no longer block the after-close update.
-  #   - Runs whose jobs were all skipped don't count either (GitHub marks
-  #     those "success" even though nothing was published).
-  #
-  # Scheduled runs then wait for TODAY's daily bar (data freshness gate):
-  #   - Yahoo can publish the day's daily bar a while after the 4:00 PM close.
-  #     Without this gate, a run that downloads too early builds everything on
-  #     the PREVIOUS day's bar, so the dashboard shows yesterday and the email
-  #     alerts fire a day late.
-  #   - The gate re-checks every 3 minutes (up to MAX_WAIT_MIN) until SPY and
-  #     the signal ticker both have a bar dated today, then lets the scanners run.
-  #   - If today's bar never shows up, the run fails instead of publishing stale
-  #     data (and instead of re-sending yesterday's alert). The 5:47 PM backup
-  #     then tries again.
-  #   - NYSE holidays: nothing new to publish, so the run is skipped (this also
-  #     stops a repeat of the previous day's alert email on holidays).
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 85
+    timeout-minutes: 10
     outputs:
-      skip: ${{ steps.c.outputs.skip == 'true' || steps.fresh.outputs.skip == 'true' }}
+      run: ${{ steps.decide.outputs.run }}
+      session: ${{ steps.decide.outputs.session }}
     steps:
-      - id: c
+      # What session is on the live dashboard right now? (data_as_of.txt is
+      # written by every publish below.) Blank if it can't be read.
+      - name: Read what the live dashboard has
+        id: live
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          url=$(gh api "repos/$GITHUB_REPOSITORY/pages" -q .html_url 2>/dev/null || true)
+          asof=""
+          if [ -n "$url" ]; then
+            asof=$(curl -fsSL "${url%/}/data_as_of.txt?nocache=$(date +%s)" 2>/dev/null | head -c 10 || true)
           fi
-          since="$(TZ=America/New_York date +%F)T16:00:00$(TZ=America/New_York date +%:z)"
-          echo "Looking for deployed runs created since $since"
-          ids=$(gh run list -R "$GITHUB_REPOSITORY" -w "${{ github.workflow }}" \
-                  --status success --created ">=$since" \
-                  --json databaseId -q '.[].databaseId')
-          skip=false
-          for id in $ids; do
-            [ "$id" = "${{ github.run_id }}" ] && continue
-            deployed=$(gh run view "$id" -R "$GITHUB_REPOSITORY" --json jobs \
-                         -q '[.jobs[] | select(.name=="deploy-pages" and .conclusion=="success")] | length')
-            echo "Run $id deployed: $deployed"
-            if [ "$deployed" -gt 0 ]; then
-              skip=true
-              break
-            fi
-          done
-          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          echo "Pages URL: ${url:-unknown} | dashboard data as of: ${asof:-unknown}"
+          echo "asof=$asof" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-python@v5
-        if: github.event_name == 'schedule' && steps.c.outputs.skip != 'true'
         with:
           python-version: '3.11'
 
-      - name: Wait for today's daily bar (data freshness gate)
-        id: fresh
-        if: github.event_name == 'schedule' && steps.c.outputs.skip != 'true'
+      - name: Decide whether to publish
+        id: decide
         env:
-          SIGNAL_TICKER: TSLA
-          MAX_WAIT_MIN: '75'
+          GH_TOKEN: ${{ github.token }}
+          LIVE_ASOF: ${{ steps.live.outputs.asof }}
+          EVENT: ${{ github.event_name }}
+          FORCE: ${{ inputs.force }}
+          RUN_ID: ${{ github.run_id }}
+          WORKFLOW: ${{ github.workflow }}
         run: |
           pip install -q yfinance pandas pandas_market_calendars
           python - <<'PY'
-          import os, sys, time
-          from datetime import datetime
+          import json, os, subprocess, sys
+          from datetime import timedelta
           from zoneinfo import ZoneInfo
 
           import pandas as pd
@@ -97,32 +103,70 @@ jobs:
           import yfinance as yf
 
           ET = ZoneInfo("America/New_York")
-          MAX_WAIT_MIN = int(os.environ.get("MAX_WAIT_MIN", "75"))
-          POLL_SEC = 180
-          # Same tickers and history lengths the scanners download, so this
-          # checks exactly the data they are about to use.
-          CHECKS = [("SPY", "3y"), (os.environ.get("SIGNAL_TICKER", "TSLA"), "max")]
+          CT = ZoneInfo("America/Chicago")
+          BUFFER = timedelta(minutes=int(os.environ.get("BUFFER_MIN", "30")))
+          SCHEDULED = os.environ.get("EVENT") == "schedule"
+          FORCE = os.environ.get("FORCE", "").lower() == "true"
+          # Tickers that must show the session's bar before anything is built.
+          # Same history lengths the scanners use, so this tests the same requests.
+          CHECKS = [
+              ("SPY", "3y"), ("^GSPC", "3y"), ("^VIX", "3y"), ("XLK", "3y"), ("IWM", "3y"),
+              (os.environ.get("SIGNAL_TICKER", "TSLA"), "max"), ("AAPL", "max"),
+          ]
 
-          def set_output(key, value):
+          def out(**kv):
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                  f.write(f"{key}={value}\n")
+                  for k, v in kv.items():
+                      f.write(f"{k}={v}\n")
 
-          now = datetime.now(ET)
-          today = now.date()
-          print(f"Run started {now:%a %b %d, %Y %I:%M %p %Z}")
+          def summary(msg):
+              print(msg)
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(msg + "\n")
 
-          sched = mcal.get_calendar("NYSE").schedule(start_date=today, end_date=today)
-          if sched.empty:
-              print("NYSE is closed today (holiday). Nothing new to publish, so this run is skipped.")
-              set_output("skip", "true")
-              sys.exit(0)
+          now = pd.Timestamp.now(tz=ET)
+          print(f"Woke up {now:%a %b %d %I:%M %p %Z} ({now.tz_convert(CT):%I:%M %p %Z})")
 
-          close_et = sched.iloc[0]["market_close"].tz_convert(ET)
-          if now < close_et:
-              print(f"::error::This scheduled run started at {now:%I:%M %p %Z}, before today's close "
-                    f"({close_et:%I:%M %p %Z}). Check the schedule's timezone setting.")
-              sys.exit(1)
+          # 1. Target session = latest NYSE session that closed >= BUFFER ago.
+          sched = mcal.get_calendar("NYSE").schedule(
+              start_date=(now - timedelta(days=14)).date(), end_date=now.date())
+          closes = sched["market_close"].dt.tz_convert(ET)
+          ready = closes[closes + BUFFER <= now]
+          session = ready.index[-1].date()
+          close_t = ready.iloc[-1]
+          print(f"Session to publish: {session:%a %b %d} (closed {close_t:%I:%M %p %Z})")
+          out(session=session.isoformat())
 
+          # 2. Already published?
+          live = os.environ.get("LIVE_ASOF", "").strip()
+          if SCHEDULED:
+              done = False
+              if live:
+                  done = live >= session.isoformat()
+                  print(f"Live dashboard is on {live}.")
+              else:
+                  # Couldn't read the dashboard: fall back to run history. Any run that
+                  # deployed after this session's close went through this same check.
+                  since = (close_t + BUFFER).isoformat()
+                  ids = subprocess.run(
+                      ["gh", "run", "list", "-R", os.environ["GITHUB_REPOSITORY"], "-w", os.environ["WORKFLOW"],
+                       "--status", "success", "--created", f">={since}", "--json", "databaseId",
+                       "-q", ".[].databaseId"], capture_output=True, text=True).stdout.split()
+                  for rid in ids:
+                      if rid == os.environ["RUN_ID"]:
+                          continue
+                      jobs = json.loads(subprocess.run(
+                          ["gh", "run", "view", rid, "-R", os.environ["GITHUB_REPOSITORY"], "--json", "jobs"],
+                          capture_output=True, text=True).stdout or "{}").get("jobs", [])
+                      if any(j["name"] == "deploy-pages" and j["conclusion"] == "success" for j in jobs):
+                          done = True
+                          break
+              if done:
+                  summary(f"{session:%a %b %d} is already published. Nothing to do.")
+                  out(run="false")
+                  sys.exit(0)
+
+          # 3. Has Yahoo posted the session's bar?
           def latest_bar(ticker, period):
               df = yf.download(ticker, period=period, interval="1d", auto_adjust=True, progress=False)
               if df is None or df.empty:
@@ -132,74 +176,31 @@ jobs:
                   idx = idx.tz_convert(ET).tz_localize(None)
               return idx.max().date()
 
-          deadline = time.time() + MAX_WAIT_MIN * 60
-          attempt = 0
-          while True:
-              attempt += 1
-              stamp = datetime.now(ET).strftime("%I:%M %p %Z")
-              results = {}
-              for ticker, period in CHECKS:
-                  try:
-                      results[ticker] = latest_bar(ticker, period)
-                  except Exception as e:
-                      print(f"  {ticker}: download error ({e})")
-                      results[ticker] = None
-              shown = ", ".join(f"{t} {d or 'n/a'}" for t, d in results.items())
-              if all(d == today for d in results.values()):
-                  print(f"[{stamp}] check {attempt}: latest bars {shown} -> today's bar is in. Running scanners.")
-                  set_output("skip", "false")
-                  sys.exit(0)
-              if time.time() + POLL_SEC > deadline:
-                  print(f"::error::[{stamp}] Yahoo still has no bar for {today} after {MAX_WAIT_MIN} min "
-                        f"(latest: {shown}). Not publishing stale data; the backup run will try again.")
-                  sys.exit(1)
-              print(f"[{stamp}] check {attempt}: latest bars {shown}, waiting for {today}. "
-                    f"Re-checking in {POLL_SEC // 60} min...")
-              time.sleep(POLL_SEC)
+          bars = {}
+          for t, p in CHECKS:
+              try:
+                  bars[t] = latest_bar(t, p)
+              except Exception as e:
+                  print(f"  {t}: download error ({e})")
+                  bars[t] = None
+          shown = ", ".join(f"{t} {d or 'n/a'}" for t, d in bars.items())
+          print(f"Latest bars on Yahoo: {shown}")
+          missing = [t for t, d in bars.items() if d is None or d < session]
+
+          if missing and not FORCE:
+              summary(f"Waiting: Yahoo hasn't posted {session:%a %b %d} yet for {', '.join(missing)} "
+                      f"({shown}). The next scheduled wake-up will try again.")
+              out(run="false")
+              sys.exit(0)
+
+          summary(f"Publishing {session:%a %b %d}" + (" (FORCED, some data may be older)" if missing else "") +
+                  f". Latest bars: {shown}")
+          out(run="true")
           PY
-
-  Scanner_All-Time-Highs:
-    needs: check
-    if: needs.check.outputs.skip != 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: pip install -r requirements.txt
-      - name: Run All-Time-High Scanner
-        env:
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-          ALERT_TO: jordycrod1@gmail.com
-        run: python scanner_All-Time-High_1.py
-
-  # Buy/sell email alerts from the multi-timeframe indicator scanner (TSLA).
-  # Emails only when the buy and/or sell rule fires on today's close.
-  Scanner_MTF-Buy-Sell-Signals:
-    needs: check
-    if: needs.check.outputs.skip != 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: pip install -r requirements.txt
-      - name: Run multi-timeframe buy/sell signal scanner
-        env:
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-          ALERT_TO: jordycrod1@gmail.com
-          SIGNAL_TICKER: TSLA
-        run: python mtf_signal_scanner.py --alert
 
   Dashboard:
     needs: check
-    if: needs.check.outputs.skip != 'true'
+    if: needs.check.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -227,11 +228,28 @@ jobs:
           BACKTEST_OUTPUT_DIR: site/scanners/mtf-signals-backtest
           BACKTEST_HTML_NAME: index.html
           BACKTEST_PLOTLY_JS: cdn
-          SIGNAL_TICKER: TSLA
         run: python mtf_signal_scanner.py
 
       - name: Generate S&P 500 dashboard
-        run: python dashboard_sp500.py
+        shell: bash
+        run: python dashboard_sp500.py | tee dashboard.log
+
+      # Safety net: never publish a dashboard built on an older day than the
+      # one the check job confirmed (e.g. if Yahoo hiccuped mid-run).
+      - name: Confirm the dashboard used the right session
+        shell: bash
+        env:
+          SESSION: ${{ needs.check.outputs.session }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          asof=$(grep -oP 'Latest SPY daily bar: \K[0-9-]{10}' dashboard.log | tail -1 || true)
+          echo "Dashboard built on SPY bar $asof (expected $SESSION)"
+          if [ "$asof" \< "$SESSION" ] && [ "$FORCE" != "true" ]; then
+            echo "::error::Dashboard got $asof instead of $SESSION. Not publishing; the next wake-up will retry."
+            exit 1
+          fi
+          echo "$asof" > site/data_as_of.txt
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
@@ -248,3 +266,43 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+  # Alert emails go out only AFTER the dashboard for that session is live,
+  # so each session's emails are sent once and match what the dashboard shows.
+  Scanner_All-Time-Highs:
+    needs: [check, deploy-pages]
+    if: needs.check.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Run All-Time-High Scanner
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          ALERT_TO: jordycrod1@gmail.com
+        run: python scanner_All-Time-High_1.py
+
+  # Buy/sell email alerts from the multi-timeframe indicator scanner (TSLA).
+  # Emails only when the buy and/or sell rule fires on the session's close.
+  Scanner_MTF-Buy-Sell-Signals:
+    needs: [check, deploy-pages]
+    if: needs.check.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Run multi-timeframe buy/sell signal scanner
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          ALERT_TO: jordycrod1@gmail.com
+        run: python mtf_signal_scanner.py --alert

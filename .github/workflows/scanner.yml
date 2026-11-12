@@ -137,6 +137,17 @@ jobs:
           print(f"Session to publish: {session:%a %b %d} (closed {close_t:%I:%M %p %Z})")
           out(session=session.isoformat())
 
+          # If GitHub started this scheduled run so late that the market is already
+          # open again, don't publish: Yahoo would hand back today's in-progress
+          # prices. The after-close runs will publish today's session instead.
+          if SCHEDULED and not sched.empty and sched.index[-1].date() == now.date():
+              open_t = sched["market_open"].iloc[-1].tz_convert(ET)
+              if open_t <= now < closes.iloc[-1] + BUFFER:
+                  summary(f"Market is open (started {now:%I:%M %p %Z}). Skipping; "
+                          f"today's session will publish after the close.")
+                  out(run="false")
+                  sys.exit(0)
+
           # 2. Already published?
           live = os.environ.get("LIVE_ASOF", "").strip()
           if SCHEDULED:
@@ -248,7 +259,12 @@ jobs:
             echo "::error::Dashboard got $asof instead of $SESSION. Not publishing; the next wake-up will retry."
             exit 1
           fi
-          echo "$asof" > site/data_as_of.txt
+          # Record the session that was published (never a later, in-progress day
+          # from a manual run during market hours), so tonight's after-close run
+          # still knows today's session is not published yet.
+          if [ "$asof" \< "$SESSION" ]; then marker="$asof"; else marker="$SESSION"; fi
+          echo "$marker" > site/data_as_of.txt
+          echo "Marked dashboard as: $marker"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
